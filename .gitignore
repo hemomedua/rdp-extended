@@ -1,0 +1,14 @@
+*.exe
+*.dll
+*.so
+*.dylib
+dist/
+build/
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+go.sum
+*.log
