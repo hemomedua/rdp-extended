@@ -1,265 +1,783 @@
 package main
 
 import (
-	"bufio"
-	"fmt"
-	"os"
 	"sort"
-	"strings"
+	"syscall"
+	"unsafe"
 )
+
+// ==================== Win32 API bindings ====================
 
 var (
-	db              *Database
-	rdpExecutor     *RDPExecutor
-	currentHosts    []string
-	currentProfiles []RDPProfile
+	kernel32 = syscall.NewLazyDLL("kernel32.dll")
+	user32   = syscall.NewLazyDLL("user32.dll")
+
+	procGetModuleHandleW    = kernel32.NewProc("GetModuleHandleW")
+	procRegisterClassExW    = user32.NewProc("RegisterClassExW")
+	procCreateWindowExW     = user32.NewProc("CreateWindowExW")
+	procDefWindowProcW      = user32.NewProc("DefWindowProcW")
+	procShowWindow          = user32.NewProc("ShowWindow")
+	procUpdateWindow        = user32.NewProc("UpdateWindow")
+	procGetMessageW         = user32.NewProc("GetMessageW")
+	procTranslateMessage    = user32.NewProc("TranslateMessage")
+	procDispatchMessageW    = user32.NewProc("DispatchMessageW")
+	procPostQuitMessage     = user32.NewProc("PostQuitMessage")
+	procDestroyWindow       = user32.NewProc("DestroyWindow")
+	procLoadCursorW         = user32.NewProc("LoadCursorW")
+	procSendDlgItemMessageW = user32.NewProc("SendDlgItemMessageW")
+	procGetDlgItemTextW     = user32.NewProc("GetDlgItemTextW")
+	procSetDlgItemTextW     = user32.NewProc("SetDlgItemTextW")
+	procCheckDlgButton      = user32.NewProc("CheckDlgButton")
+	procIsDlgButtonChecked  = user32.NewProc("IsDlgButtonChecked")
+	procEnableWindow        = user32.NewProc("EnableWindow")
+	procSetForegroundWindow = user32.NewProc("SetForegroundWindow")
+	procMessageBoxW         = user32.NewProc("MessageBoxW")
 )
 
-// Simple GUI using Windows MessageBox for now (will be expanded)
+type WNDCLASSEXW struct {
+	cbSize        uint32
+	style         uint32
+	lpfnWndProc   uintptr
+	cbClsExtra    int32
+	cbWndExtra    int32
+	hInstance     uintptr
+	hIcon         uintptr
+	hCursor       uintptr
+	hbrBackground uintptr
+	lpszMenuName  *uint16
+	lpszClassName *uint16
+	hIconSm       uintptr
+}
+
+type MSG struct {
+	Hwnd    uintptr
+	Message uint32
+	WParam  uintptr
+	LParam  uintptr
+	Time    uint32
+	Pt      struct{ X, Y int32 }
+}
+
+const (
+	WS_OVERLAPPED       = 0x00000000
+	WS_CAPTION          = 0x00C00000
+	WS_SYSMENU          = 0x00080000
+	WS_THICKFRAME       = 0x00040000
+	WS_MINIMIZEBOX      = 0x00020000
+	WS_MAXIMIZEBOX      = 0x00010000
+	WS_OVERLAPPEDWINDOW = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX
+	WS_CHILD            = 0x40000000
+	WS_VISIBLE          = 0x10000000
+	WS_TABSTOP          = 0x00010000
+	WS_BORDER           = 0x00800000
+	WS_VSCROLL          = 0x00200000
+
+	CBS_DROPDOWNLIST = 0x0003
+	ES_PASSWORD      = 0x0020
+	BS_AUTOCHECKBOX  = 0x0003
+
+	SW_SHOW = 5
+
+	WM_CREATE  = 0x0001
+	WM_DESTROY = 0x0002
+	WM_CLOSE   = 0x0010
+	WM_COMMAND = 0x0111
+
+	CB_GETLBTEXT    = 0x0148
+	CB_ADDSTRING    = 0x0143
+	CB_RESETCONTENT = 0x014B
+	CB_GETCURSEL    = 0x0147
+	CB_SETCURSEL    = 0x014E
+
+	CBN_SELCHANGE = 5
+	BN_CLICKED    = 0
+
+	MB_OK        = 0x00000000
+	MB_ICONERROR = 0x00000010
+	MB_ICONINFO  = 0x00000040
+
+	BST_CHECKED = 1
+)
+
+// Control IDs - Main window
+const (
+	ID_HOST_COMBO = 101
+	ID_USER_COMBO = 102
+	ID_CONNECT    = 103
+	ID_NEW        = 104
+	ID_EDIT       = 105
+	ID_DELETE     = 106
+	ID_SETTINGS   = 107
+)
+
+// Control IDs - Edit window
+const (
+	ID_E_HOST      = 201
+	ID_E_PORT      = 202
+	ID_E_USER      = 203
+	ID_E_PASS      = 204
+	ID_E_RES       = 205
+	ID_E_CLIPBOARD = 206
+	ID_E_DISKS     = 207
+	ID_E_PROXYMODE = 208
+	ID_E_PROXYADDR = 209
+	ID_E_SAVE      = 210
+	ID_E_CANCEL    = 211
+	ID_E_DELETE    = 212
+)
+
+// Control IDs - Settings window
+const (
+	ID_S_PROXYMODE = 301
+	ID_S_PROXYADDR = 302
+	ID_S_SAVE      = 303
+	ID_S_CANCEL    = 304
+)
+
+// ==================== Globals ====================
+
+var (
+	db          *Database
+	rdpExecutor *RDPExecutor
+
+	hInstance    uintptr
+	mainHwnd     uintptr
+	editHwnd     uintptr
+	settingsHwnd uintptr
+
+	hostList          []string
+	currentProfiles   []RDPProfile
+	editingProfile    *RDPProfile
+	isEditingExisting bool
+)
+
+func utf16ptr(s string) *uint16 {
+	p, _ := syscall.UTF16PtrFromString(s)
+	return p
+}
+
+func msgBox(text, title string, flags uint32) {
+	procMessageBoxW.Call(0, uintptr(unsafe.Pointer(utf16ptr(text))), uintptr(unsafe.Pointer(utf16ptr(title))), uintptr(flags))
+}
+
+func comboAddString(hwndParent uintptr, id int, text string) {
+	procSendDlgItemMessageW.Call(hwndParent, uintptr(id), CB_ADDSTRING, 0, uintptr(unsafe.Pointer(utf16ptr(text))))
+}
+
+func comboReset(hwndParent uintptr, id int) {
+	procSendDlgItemMessageW.Call(hwndParent, uintptr(id), CB_RESETCONTENT, 0, 0)
+}
+
+func comboSetSel(hwndParent uintptr, id int, index int) {
+	procSendDlgItemMessageW.Call(hwndParent, uintptr(id), CB_SETCURSEL, uintptr(index), 0)
+}
+
+func comboGetSel(hwndParent uintptr, id int) int {
+	ret, _, _ := procSendDlgItemMessageW.Call(hwndParent, uintptr(id), CB_GETCURSEL, 0, 0)
+	return int(int32(ret))
+}
+
+func getDlgText(hwndParent uintptr, id int) string {
+	buf := make([]uint16, 512)
+	procGetDlgItemTextW.Call(hwndParent, uintptr(id), uintptr(unsafe.Pointer(&buf[0])), uintptr(len(buf)))
+	return syscall.UTF16ToString(buf)
+}
+
+func setChecked(hwndParent uintptr, id int, checked bool) {
+	val := 0
+	if checked {
+		val = BST_CHECKED
+	}
+	procCheckDlgButton.Call(hwndParent, uintptr(id), uintptr(val))
+}
+
+func isChecked(hwndParent uintptr, id int) bool {
+	ret, _, _ := procIsDlgButtonChecked.Call(hwndParent, uintptr(id))
+	return ret == BST_CHECKED
+}
+
+func createLabel(parent uintptr, text string, x, y, w, h int32) {
+	procCreateWindowExW.Call(
+		0,
+		uintptr(unsafe.Pointer(utf16ptr("STATIC"))),
+		uintptr(unsafe.Pointer(utf16ptr(text))),
+		uintptr(WS_CHILD|WS_VISIBLE),
+		uintptr(x), uintptr(y), uintptr(w), uintptr(h),
+		parent, 0, hInstance, 0,
+	)
+}
+
+func createEdit(parent uintptr, id int, text string, x, y, w, h int32, password bool) {
+	style := uintptr(WS_CHILD | WS_VISIBLE | WS_BORDER | WS_TABSTOP)
+	if password {
+		style |= ES_PASSWORD
+	}
+	procCreateWindowExW.Call(
+		0,
+		uintptr(unsafe.Pointer(utf16ptr("EDIT"))),
+		uintptr(unsafe.Pointer(utf16ptr(text))),
+		style,
+		uintptr(x), uintptr(y), uintptr(w), uintptr(h),
+		parent, uintptr(id), hInstance, 0,
+	)
+}
+
+func createCombo(parent uintptr, id int, x, y, w, h int32) {
+	procCreateWindowExW.Call(
+		0,
+		uintptr(unsafe.Pointer(utf16ptr("COMBOBOX"))),
+		0,
+		uintptr(WS_CHILD|WS_VISIBLE|WS_TABSTOP|WS_VSCROLL|CBS_DROPDOWNLIST),
+		uintptr(x), uintptr(y), uintptr(w), uintptr(h),
+		parent, uintptr(id), hInstance, 0,
+	)
+}
+
+func createButton(parent uintptr, id int, text string, x, y, w, h int32) {
+	procCreateWindowExW.Call(
+		0,
+		uintptr(unsafe.Pointer(utf16ptr("BUTTON"))),
+		uintptr(unsafe.Pointer(utf16ptr(text))),
+		uintptr(WS_CHILD|WS_VISIBLE|WS_TABSTOP),
+		uintptr(x), uintptr(y), uintptr(w), uintptr(h),
+		parent, uintptr(id), hInstance, 0,
+	)
+}
+
+func createCheckbox(parent uintptr, id int, text string, x, y, w, h int32) {
+	procCreateWindowExW.Call(
+		0,
+		uintptr(unsafe.Pointer(utf16ptr("BUTTON"))),
+		uintptr(unsafe.Pointer(utf16ptr(text))),
+		uintptr(WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_AUTOCHECKBOX),
+		uintptr(x), uintptr(y), uintptr(w), uintptr(h),
+		parent, uintptr(id), hInstance, 0,
+	)
+}
+
+// ==================== Entry point ====================
+
+// CreateMainWindow is the entry point called from main.go
 func CreateMainWindow(database *Database, executor *RDPExecutor) error {
 	db = database
 	rdpExecutor = executor
 
-	// Load system and database hosts
+	hMod, _, _ := procGetModuleHandleW.Call(0)
+	hInstance = hMod
+
+	mainProc := syscall.NewCallback(mainWndProc)
+	editProc := syscall.NewCallback(editWndProc)
+	settingsProc := syscall.NewCallback(settingsWndProc)
+
+	registerClass("RDPMainWindowClass", mainProc)
+	registerClass("RDPEditWindowClass", editProc)
+	registerClass("RDPSettingsWindowClass", settingsProc)
+
 	hosts, _ := GetSystemHostsWithDB(db)
 	sort.Strings(hosts)
-	currentHosts = hosts
+	hostList = hosts
 
-	// For now, show a simple menu-driven interface in CLI
-	showMainMenu()
+	mainHwnd, _, _ = procCreateWindowExW.Call(
+		0,
+		uintptr(unsafe.Pointer(utf16ptr("RDPMainWindowClass"))),
+		uintptr(unsafe.Pointer(utf16ptr("RDP+ Extended"))),
+		uintptr(WS_OVERLAPPEDWINDOW),
+		200, 200, 480, 300,
+		0, 0, hInstance, 0,
+	)
+
+	procShowWindow.Call(mainHwnd, SW_SHOW)
+	procUpdateWindow.Call(mainHwnd)
+
+	runMessageLoop()
 	return nil
 }
 
-func showMainMenu() {
-	reader := bufio.NewReader(os.Stdin)
-	
-	fmt.Println("\n=== RDP+ Extended ===")
-	fmt.Println("1. Connect to host")
-	fmt.Println("2. Add new profile")
-	fmt.Println("3. Edit profile")
-	fmt.Println("4. List profiles")
-	fmt.Println("5. Settings")
-	fmt.Println("6. Exit")
-	fmt.Print("Select option: ")
+func registerClass(name string, proc uintptr) {
+	curCursor, _, _ := procLoadCursorW.Call(0, 32512) // IDC_ARROW
 
-	input, _ := reader.ReadString('\n')
-	input = strings.TrimSpace(input)
-	
-	var choice int
-	fmt.Sscanf(input, "%d", &choice)
+	var wc WNDCLASSEXW
+	wc.cbSize = uint32(unsafe.Sizeof(wc))
+	wc.lpfnWndProc = proc
+	wc.hInstance = hInstance
+	wc.hCursor = curCursor
+	wc.hbrBackground = 6 // COLOR_WINDOW + 1
+	wc.lpszClassName = utf16ptr(name)
 
-	switch choice {
-	case 1:
-		menuConnect()
-	case 2:
-		menuAddProfile()
-	case 3:
-		menuEditProfile()
-	case 4:
-		menuList()
-	case 5:
-		menuSettings()
-	case 6:
-		return
-	default:
-		fmt.Println("Invalid option")
-		showMainMenu()
+	procRegisterClassExW.Call(uintptr(unsafe.Pointer(&wc)))
+}
+
+func runMessageLoop() {
+	var msg MSG
+	for {
+		ret, _, _ := procGetMessageW.Call(uintptr(unsafe.Pointer(&msg)), 0, 0, 0)
+		if int32(ret) <= 0 {
+			break
+		}
+		procTranslateMessage.Call(uintptr(unsafe.Pointer(&msg)))
+		procDispatchMessageW.Call(uintptr(unsafe.Pointer(&msg)))
 	}
 }
 
-func menuConnect() {
-	fmt.Print("Enter host (or leave empty to select): ")
-	var host string
-	fmt.Scanln(&host)
+// ==================== Main window ====================
 
-	if host == "" {
-		fmt.Println("Available hosts:")
-		for i, h := range currentHosts {
-			fmt.Printf("%d. %s\n", i+1, h)
-		}
-		fmt.Print("Select host number: ")
-		var idx int
-		fmt.Scanln(&idx)
-		if idx > 0 && idx <= len(currentHosts) {
-			host = currentHosts[idx-1]
-		}
-	}
+func mainWndProc(hwnd uintptr, msg uint32, wparam, lparam uintptr) uintptr {
+	switch msg {
+	case WM_CREATE:
+		createLabel(hwnd, "Host:", 15, 20, 80, 20)
+		createCombo(hwnd, ID_HOST_COMBO, 100, 18, 340, 200)
 
-	profiles, _ := db.GetProfilesByHost(host)
-	if len(profiles) == 0 {
-		fmt.Printf("No profiles found for %s\n", host)
-		showMainMenu()
-		return
-	}
+		createLabel(hwnd, "Username:", 15, 55, 80, 20)
+		createCombo(hwnd, ID_USER_COMBO, 100, 53, 340, 200)
 
-	if len(profiles) == 1 {
-		if err := rdpExecutor.ExecuteRDP(&profiles[0]); err != nil {
-			fmt.Printf("Error: %v\n", err)
-		}
-	} else {
-		fmt.Println("Select username:")
-		for i, p := range profiles {
-			fmt.Printf("%d. %s\n", i+1, p.Username)
-		}
-		fmt.Print("Select: ")
-		var idx int
-		fmt.Scanln(&idx)
-		if idx > 0 && idx <= len(profiles) {
-			if err := rdpExecutor.ExecuteRDP(&profiles[idx-1]); err != nil {
-				fmt.Printf("Error: %v\n", err)
+		createButton(hwnd, ID_CONNECT, "Connect", 15, 95, 100, 30)
+		createButton(hwnd, ID_NEW, "New Profile", 125, 95, 100, 30)
+		createButton(hwnd, ID_EDIT, "Edit Profile", 235, 95, 100, 30)
+		createButton(hwnd, ID_DELETE, "Delete", 345, 95, 95, 30)
+
+		createButton(hwnd, ID_SETTINGS, "Global Settings", 15, 135, 165, 30)
+
+		createLabel(hwnd, "Tip: double-click a host in the list to select it, then pick a username.", 15, 180, 440, 40)
+
+		refreshHostCombo(hwnd)
+		return 0
+
+	case WM_COMMAND:
+		id := int(loword(wparam))
+		code := int(hiword(wparam))
+
+		if id == ID_HOST_COMBO && code == CBN_SELCHANGE {
+			onHostChanged(hwnd)
+		} else if code == BN_CLICKED {
+			switch id {
+			case ID_CONNECT:
+				onConnectClicked(hwnd)
+			case ID_NEW:
+				openEditWindow(hwnd, nil)
+			case ID_EDIT:
+				onEditClicked(hwnd)
+			case ID_DELETE:
+				onDeleteClicked(hwnd)
+			case ID_SETTINGS:
+				openSettingsWindow(hwnd)
 			}
 		}
+		return 0
+
+	case WM_CLOSE:
+		procDestroyWindow.Call(hwnd)
+		return 0
+
+	case WM_DESTROY:
+		procPostQuitMessage.Call(0)
+		return 0
 	}
-	showMainMenu()
+
+	ret, _, _ := procDefWindowProcW.Call(hwnd, uintptr(msg), wparam, lparam)
+	return ret
 }
 
-func menuAddProfile() {
-	var profile RDPProfile
+func loword(v uintptr) uint16 { return uint16(v & 0xFFFF) }
+func hiword(v uintptr) uint16 { return uint16((v >> 16) & 0xFFFF) }
 
-	fmt.Print("Host: ")
-	fmt.Scanln(&profile.Host)
-	fmt.Print("Username: ")
-	fmt.Scanln(&profile.Username)
-	fmt.Print("Password: ")
-	fmt.Scanln(&profile.Password)
+func refreshHostCombo(hwnd uintptr) {
+	hosts, _ := GetSystemHostsWithDB(db)
+	sort.Strings(hosts)
+	hostList = hosts
 
-	profile.Port = 3389
-	profile.Resolution = "1920x1080"
-	profile.ClipboardEnabled = true
-	profile.DisksEnabled = true
-	profile.DisksRedirect = "all"
-	profile.DisksDynamic = true
-	profile.ProxyMode = "direct"
-
-	if err := db.AddProfile(&profile); err != nil {
-		fmt.Printf("Error: %v\n", err)
+	comboReset(hwnd, ID_HOST_COMBO)
+	for _, h := range hostList {
+		comboAddString(hwnd, ID_HOST_COMBO, h)
+	}
+	if len(hostList) > 0 {
+		comboSetSel(hwnd, ID_HOST_COMBO, 0)
+		onHostChanged(hwnd)
 	} else {
-		fmt.Println("Profile saved successfully")
+		comboReset(hwnd, ID_USER_COMBO)
+		currentProfiles = nil
 	}
-
-	// Reload hosts
-	currentHosts, _ = GetSystemHostsWithDB(db)
-	sort.Strings(currentHosts)
-
-	showMainMenu()
 }
 
-func menuEditProfile() {
-	fmt.Print("Host: ")
-	var host string
-	fmt.Scanln(&host)
+func onHostChanged(hwnd uintptr) {
+	idx := comboGetSel(hwnd, ID_HOST_COMBO)
+	comboReset(hwnd, ID_USER_COMBO)
+	currentProfiles = nil
 
-	profiles, _ := db.GetProfilesByHost(host)
-	if len(profiles) == 0 {
-		fmt.Printf("No profiles found for %s\n", host)
-		showMainMenu()
+	if idx < 0 || idx >= len(hostList) {
 		return
 	}
 
-	if len(profiles) > 1 {
-		fmt.Println("Select profile:")
-		for i, p := range profiles {
-			fmt.Printf("%d. %s\n", i+1, p.Username)
+	host := hostList[idx]
+	profiles, _ := db.GetProfilesByHost(host)
+	currentProfiles = profiles
+
+	for _, p := range profiles {
+		comboAddString(hwnd, ID_USER_COMBO, p.Username)
+	}
+	if len(profiles) > 0 {
+		comboSetSel(hwnd, ID_USER_COMBO, 0)
+	}
+}
+
+func getSelectedProfile(hwnd uintptr) *RDPProfile {
+	uidx := comboGetSel(hwnd, ID_USER_COMBO)
+	if uidx < 0 || uidx >= len(currentProfiles) {
+		return nil
+	}
+	p := currentProfiles[uidx]
+	return &p
+}
+
+func onConnectClicked(hwnd uintptr) {
+	profile := getSelectedProfile(hwnd)
+	if profile == nil {
+		msgBox("Please select a host and username first.", "RDP+ Extended", MB_OK|MB_ICONERROR)
+		return
+	}
+
+	if err := rdpExecutor.ExecuteRDP(profile); err != nil {
+		msgBox("Connection failed: "+err.Error(), "RDP+ Extended", MB_OK|MB_ICONERROR)
+		return
+	}
+}
+
+func onEditClicked(hwnd uintptr) {
+	profile := getSelectedProfile(hwnd)
+	if profile == nil {
+		msgBox("Please select a profile to edit.", "RDP+ Extended", MB_OK|MB_ICONERROR)
+		return
+	}
+	openEditWindow(hwnd, profile)
+}
+
+func onDeleteClicked(hwnd uintptr) {
+	profile := getSelectedProfile(hwnd)
+	if profile == nil {
+		msgBox("Please select a profile to delete.", "RDP+ Extended", MB_OK|MB_ICONERROR)
+		return
+	}
+
+	if err := db.DeleteProfile(profile.Host, profile.Username); err != nil {
+		msgBox("Error deleting profile: "+err.Error(), "RDP+ Extended", MB_OK|MB_ICONERROR)
+		return
+	}
+
+	refreshHostCombo(hwnd)
+}
+
+// ==================== Edit / New profile window ====================
+
+func openEditWindow(owner uintptr, profile *RDPProfile) {
+	if profile == nil {
+		editingProfile = &RDPProfile{
+			Port:             3389,
+			Resolution:       "1920x1080",
+			ClipboardEnabled: true,
+			DisksEnabled:     true,
+			DisksRedirect:    "all",
+			DisksDynamic:     true,
+			ProxyMode:        "direct",
 		}
-		var idx int
-		fmt.Print("Select: ")
-		fmt.Scanln(&idx)
-		if idx < 1 || idx > len(profiles) {
-			showMainMenu()
+		isEditingExisting = false
+	} else {
+		p := *profile
+		editingProfile = &p
+		isEditingExisting = true
+	}
+
+	procEnableWindow.Call(owner, 0)
+
+	title := "New Profile"
+	if isEditingExisting {
+		title = "Edit Profile"
+	}
+
+	style := uintptr(WS_OVERLAPPEDWINDOW)
+	style &^= uintptr(WS_MAXIMIZEBOX)
+	style &^= uintptr(WS_THICKFRAME)
+
+	editHwnd, _, _ = procCreateWindowExW.Call(
+		0,
+		uintptr(unsafe.Pointer(utf16ptr("RDPEditWindowClass"))),
+		uintptr(unsafe.Pointer(utf16ptr(title))),
+		style,
+		250, 150, 420, 500,
+		owner, 0, hInstance, 0,
+	)
+
+	procShowWindow.Call(editHwnd, SW_SHOW)
+	procUpdateWindow.Call(editHwnd)
+}
+
+func editWndProc(hwnd uintptr, msg uint32, wparam, lparam uintptr) uintptr {
+	switch msg {
+	case WM_CREATE:
+		y := int32(15)
+		createLabel(hwnd, "Host:", 15, y, 100, 20)
+		createEdit(hwnd, ID_E_HOST, editingProfile.Host, 130, y, 250, 22, false)
+		y += 32
+
+		createLabel(hwnd, "Port:", 15, y, 100, 20)
+		createEdit(hwnd, ID_E_PORT, itoa(editingProfile.Port), 130, y, 100, 22, false)
+		y += 32
+
+		createLabel(hwnd, "Username:", 15, y, 100, 20)
+		createEdit(hwnd, ID_E_USER, editingProfile.Username, 130, y, 250, 22, false)
+		y += 32
+
+		createLabel(hwnd, "Password:", 15, y, 100, 20)
+		createEdit(hwnd, ID_E_PASS, editingProfile.Password, 130, y, 250, 22, true)
+		y += 40
+
+		createLabel(hwnd, "Resolution:", 15, y, 100, 20)
+		createCombo(hwnd, ID_E_RES, 130, y-2, 250, 200)
+		for _, r := range GetResolutionOptions() {
+			comboAddString(hwnd, ID_E_RES, r)
+		}
+		y += 32
+
+		createCheckbox(hwnd, ID_E_CLIPBOARD, "Enable clipboard redirection", 15, y, 300, 22)
+		y += 28
+		createCheckbox(hwnd, ID_E_DISKS, "Enable disk redirection (drives)", 15, y, 300, 22)
+		y += 40
+
+		createLabel(hwnd, "Proxy mode:", 15, y, 100, 20)
+		createCombo(hwnd, ID_E_PROXYMODE, 130, y-2, 150, 200)
+		for _, m := range []string{"direct", "global", "custom"} {
+			comboAddString(hwnd, ID_E_PROXYMODE, m)
+		}
+		y += 32
+
+		createLabel(hwnd, "Proxy addr:", 15, y, 100, 20)
+		createEdit(hwnd, ID_E_PROXYADDR, editingProfile.ProxyAddress, 130, y, 250, 22, false)
+		y += 45
+
+		createButton(hwnd, ID_E_SAVE, "Save", 40, y, 100, 32)
+		createButton(hwnd, ID_E_DELETE, "Delete", 150, y, 100, 32)
+		createButton(hwnd, ID_E_CANCEL, "Cancel", 260, y, 100, 32)
+
+		// Populate values
+		selectComboByText(hwnd, ID_E_RES, editingProfile.Resolution)
+		selectComboByText(hwnd, ID_E_PROXYMODE, editingProfile.ProxyMode)
+		setChecked(hwnd, ID_E_CLIPBOARD, editingProfile.ClipboardEnabled)
+		setChecked(hwnd, ID_E_DISKS, editingProfile.DisksEnabled)
+
+		return 0
+
+	case WM_COMMAND:
+		id := int(loword(wparam))
+		code := int(hiword(wparam))
+
+		if code == BN_CLICKED {
+			switch id {
+			case ID_E_SAVE:
+				saveEditWindow(hwnd)
+			case ID_E_DELETE:
+				deleteFromEditWindow(hwnd)
+			case ID_E_CANCEL:
+				procDestroyWindow.Call(hwnd)
+			}
+		}
+		return 0
+
+	case WM_CLOSE:
+		procDestroyWindow.Call(hwnd)
+		return 0
+
+	case WM_DESTROY:
+		procEnableWindow.Call(mainHwnd, 1)
+		procSetForegroundWindow.Call(mainHwnd)
+		return 0
+	}
+
+	ret, _, _ := procDefWindowProcW.Call(hwnd, uintptr(msg), wparam, lparam)
+	return ret
+}
+
+func saveEditWindow(hwnd uintptr) {
+	editingProfile.Host = getDlgText(hwnd, ID_E_HOST)
+	editingProfile.Username = getDlgText(hwnd, ID_E_USER)
+	editingProfile.Password = getDlgText(hwnd, ID_E_PASS)
+	editingProfile.Resolution = getDlgText(hwnd, ID_E_RES)
+	editingProfile.ProxyMode = getDlgText(hwnd, ID_E_PROXYMODE)
+	editingProfile.ProxyAddress = getDlgText(hwnd, ID_E_PROXYADDR)
+	editingProfile.ClipboardEnabled = isChecked(hwnd, ID_E_CLIPBOARD)
+	editingProfile.DisksEnabled = isChecked(hwnd, ID_E_DISKS)
+	if editingProfile.DisksEnabled {
+		editingProfile.DisksRedirect = "all"
+	} else {
+		editingProfile.DisksRedirect = "none"
+	}
+
+	portStr := getDlgText(hwnd, ID_E_PORT)
+	if p, ok := atoi(portStr); ok && p > 0 {
+		editingProfile.Port = p
+	} else {
+		editingProfile.Port = 3389
+	}
+
+	if editingProfile.Host == "" || editingProfile.Username == "" {
+		msgBox("Host and Username are required.", "RDP+ Extended", MB_OK|MB_ICONERROR)
+		return
+	}
+
+	if err := db.AddProfile(editingProfile); err != nil {
+		msgBox("Error saving profile: "+err.Error(), "RDP+ Extended", MB_OK|MB_ICONERROR)
+		return
+	}
+
+	procDestroyWindow.Call(hwnd)
+	refreshHostCombo(mainHwnd)
+}
+
+func deleteFromEditWindow(hwnd uintptr) {
+	if !isEditingExisting {
+		procDestroyWindow.Call(hwnd)
+		return
+	}
+
+	if err := db.DeleteProfile(editingProfile.Host, editingProfile.Username); err != nil {
+		msgBox("Error deleting profile: "+err.Error(), "RDP+ Extended", MB_OK|MB_ICONERROR)
+		return
+	}
+
+	procDestroyWindow.Call(hwnd)
+	refreshHostCombo(mainHwnd)
+}
+
+// ==================== Settings window ====================
+
+func openSettingsWindow(owner uintptr) {
+	procEnableWindow.Call(owner, 0)
+
+	style := uintptr(WS_OVERLAPPEDWINDOW)
+	style &^= uintptr(WS_MAXIMIZEBOX)
+	style &^= uintptr(WS_THICKFRAME)
+
+	settingsHwnd, _, _ = procCreateWindowExW.Call(
+		0,
+		uintptr(unsafe.Pointer(utf16ptr("RDPSettingsWindowClass"))),
+		uintptr(unsafe.Pointer(utf16ptr("Global Settings"))),
+		style,
+		300, 250, 380, 240,
+		owner, 0, hInstance, 0,
+	)
+
+	procShowWindow.Call(settingsHwnd, SW_SHOW)
+	procUpdateWindow.Call(settingsHwnd)
+}
+
+func settingsWndProc(hwnd uintptr, msg uint32, wparam, lparam uintptr) uintptr {
+	switch msg {
+	case WM_CREATE:
+		settings, _ := db.GetGlobalSettings()
+
+		createLabel(hwnd, "SOCKS5 proxy:", 15, 20, 120, 20)
+		createCombo(hwnd, ID_S_PROXYMODE, 140, 18, 150, 200)
+		comboAddString(hwnd, ID_S_PROXYMODE, "disabled")
+		comboAddString(hwnd, ID_S_PROXYMODE, "enabled")
+		selectComboByText(hwnd, ID_S_PROXYMODE, settings.GlobalProxyMode)
+
+		createLabel(hwnd, "Address (host:port):", 15, 60, 200, 20)
+		createEdit(hwnd, ID_S_PROXYADDR, settings.GlobalProxyAddress, 15, 85, 275, 22, false)
+
+		createButton(hwnd, ID_S_SAVE, "Save", 40, 140, 100, 32)
+		createButton(hwnd, ID_S_CANCEL, "Cancel", 160, 140, 100, 32)
+		return 0
+
+	case WM_COMMAND:
+		id := int(loword(wparam))
+		code := int(hiword(wparam))
+
+		if code == BN_CLICKED {
+			switch id {
+			case ID_S_SAVE:
+				mode := getDlgText(hwnd, ID_S_PROXYMODE)
+				addr := getDlgText(hwnd, ID_S_PROXYADDR)
+				db.SaveGlobalSettings(&GlobalSettings{
+					GlobalProxyMode:    mode,
+					GlobalProxyAddress: addr,
+				})
+				procDestroyWindow.Call(hwnd)
+			case ID_S_CANCEL:
+				procDestroyWindow.Call(hwnd)
+			}
+		}
+		return 0
+
+	case WM_CLOSE:
+		procDestroyWindow.Call(hwnd)
+		return 0
+
+	case WM_DESTROY:
+		procEnableWindow.Call(mainHwnd, 1)
+		procSetForegroundWindow.Call(mainHwnd)
+		return 0
+	}
+
+	ret, _, _ := procDefWindowProcW.Call(hwnd, uintptr(msg), wparam, lparam)
+	return ret
+}
+
+// ==================== Small helpers ====================
+
+func selectComboByText(hwnd uintptr, id int, text string) {
+	for i := 0; i < 20; i++ {
+		buf := make([]uint16, 256)
+		ret, _, _ := procSendDlgItemMessageW.Call(hwnd, uintptr(id), CB_GETLBTEXT, uintptr(i), uintptr(unsafe.Pointer(&buf[0])))
+		if int32(ret) < 0 {
+			break
+		}
+		if syscall.UTF16ToString(buf) == text {
+			comboSetSel(hwnd, id, i)
 			return
 		}
-		profiles = []RDPProfile{profiles[idx-1]}
 	}
-
-	profile := profiles[0]
-
-	fmt.Printf("Host [%s]: ", profile.Host)
-	var input string
-	fmt.Scanln(&input)
-	if input != "" {
-		profile.Host = input
-	}
-
-	fmt.Printf("Username [%s]: ", profile.Username)
-	fmt.Scanln(&input)
-	if input != "" {
-		profile.Username = input
-	}
-
-	fmt.Printf("Password [***]: ")
-	fmt.Scanln(&input)
-	if input != "" {
-		profile.Password = input
-	}
-
-	if err := db.AddProfile(&profile); err != nil {
-		fmt.Printf("Error: %v\n", err)
-	} else {
-		fmt.Println("Profile updated successfully")
-	}
-
-	showMainMenu()
+	comboSetSel(hwnd, id, 0)
 }
 
-func menuList() {
-	hosts, _ := db.GetAllHosts()
-	if len(hosts) == 0 {
-		fmt.Println("No profiles found")
-		showMainMenu()
-		return
+func itoa(n int) string {
+	if n == 0 {
+		return "0"
 	}
-
-	sort.Strings(hosts)
-	fmt.Println("\n=== Profiles ===")
-	for _, host := range hosts {
-		profiles, _ := db.GetProfilesByHost(host)
-		fmt.Printf("\n%s:\n", host)
-		for _, p := range profiles {
-			fmt.Printf("  - %s (port %d)\n", p.Username, p.Port)
-		}
+	neg := n < 0
+	if neg {
+		n = -n
 	}
-	fmt.Println()
-
-	showMainMenu()
+	var b [20]byte
+	pos := len(b)
+	for n > 0 {
+		pos--
+		b[pos] = byte('0' + n%10)
+		n /= 10
+	}
+	if neg {
+		pos--
+		b[pos] = '-'
+	}
+	return string(b[pos:])
 }
 
-func menuSettings() {
-	fmt.Println("\n=== Settings ===")
-	fmt.Println("1. Configure global SOCKS5 proxy")
-	fmt.Println("2. Back")
-	fmt.Print("Select: ")
-
-	var choice int
-	fmt.Scanln(&choice)
-
-	if choice == 1 {
-		fmt.Println("\nGlobal SOCKS5 Proxy")
-		fmt.Println("1. Enable")
-		fmt.Println("2. Disable")
-		fmt.Print("Select: ")
-
-		var enable int
-		fmt.Scanln(&enable)
-
-		if enable == 1 {
-			fmt.Print("Proxy address (host:port): ")
-			var proxy string
-			fmt.Scanln(&proxy)
-
-			newSettings := &GlobalSettings{
-				GlobalProxyMode:    "enabled",
-				GlobalProxyAddress: proxy,
-			}
-			db.SaveGlobalSettings(newSettings)
-			fmt.Println("Proxy enabled")
-		} else {
-			newSettings := &GlobalSettings{
-				GlobalProxyMode: "disabled",
-			}
-			db.SaveGlobalSettings(newSettings)
-			fmt.Println("Proxy disabled")
-		}
+func atoi(s string) (int, bool) {
+	if s == "" {
+		return 0, false
 	}
-
-	showMainMenu()
+	neg := false
+	i := 0
+	if s[0] == '-' {
+		neg = true
+		i = 1
+	}
+	n := 0
+	for ; i < len(s); i++ {
+		c := s[i]
+		if c < '0' || c > '9' {
+			return 0, false
+		}
+		n = n*10 + int(c-'0')
+	}
+	if neg {
+		n = -n
+	}
+	return n, true
 }
