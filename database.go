@@ -81,10 +81,8 @@ func (d *Database) load() error {
 	return json.Unmarshal(data, d)
 }
 
-func (d *Database) save() error {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-
+// saveLocked writes the database to disk. Callers MUST already hold d.mu (write lock).
+func (d *Database) saveLocked() error {
 	data, err := json.MarshalIndent(d, "", "  ")
 	if err != nil {
 		return err
@@ -101,13 +99,13 @@ func (d *Database) AddProfile(profile *RDPProfile) error {
 	for i, p := range d.Profiles {
 		if p.Host == profile.Host && p.Username == profile.Username {
 			d.Profiles[i] = *profile
-			return d.save()
+			return d.saveLocked()
 		}
 	}
 
 	// Add new profile
 	d.Profiles = append(d.Profiles, *profile)
-	return d.save()
+	return d.saveLocked()
 }
 
 func (d *Database) GetProfilesByHost(host string) ([]RDPProfile, error) {
@@ -168,7 +166,7 @@ func (d *Database) DeleteProfile(host, username string) error {
 		if p.Host == host && p.Username == username {
 			// Remove from slice
 			d.Profiles = append(d.Profiles[:i], d.Profiles[i+1:]...)
-			return d.save()
+			return d.saveLocked()
 		}
 	}
 
@@ -190,7 +188,7 @@ func (d *Database) SaveGlobalSettings(settings *GlobalSettings) error {
 	defer d.mu.Unlock()
 
 	d.Settings = *settings
-	return d.save()
+	return d.saveLocked()
 }
 
 func (d *Database) RecordConnection(host, username string) error {
@@ -209,7 +207,17 @@ func (d *Database) RecordConnection(host, username string) error {
 		d.History = d.History[len(d.History)-100:]
 	}
 
-	return d.save()
+	return d.saveLocked()
+}
+
+// GetHistory returns a copy of recorded connection history, most recent last.
+func (d *Database) GetHistory() []HistoryEntry {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	out := make([]HistoryEntry, len(d.History))
+	copy(out, d.History)
+	return out
 }
 
 func (d *Database) Close() error {

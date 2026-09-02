@@ -89,6 +89,14 @@ const (
 	CB_GETCURSEL    = 0x0147
 	CB_SETCURSEL    = 0x014E
 
+	LB_ADDSTRING    = 0x0180
+	LB_RESETCONTENT = 0x0184
+	LB_GETCURSEL    = 0x0188
+	LB_GETTEXT      = 0x0189
+	LB_GETCOUNT     = 0x018B
+	LBS_NOTIFY      = 0x0001
+	LBN_DBLCLK      = 2
+
 	CBN_SELCHANGE = 5
 	BN_CLICKED    = 0
 
@@ -108,6 +116,7 @@ const (
 	ID_EDIT       = 105
 	ID_DELETE     = 106
 	ID_SETTINGS   = 107
+	ID_HISTORY    = 109
 )
 
 // Control IDs - Edit window
@@ -134,6 +143,12 @@ const (
 	ID_S_CANCEL    = 304
 )
 
+// Control IDs - History window
+const (
+	ID_H_LIST  = 401
+	ID_H_CLOSE = 402
+)
+
 // ==================== Globals ====================
 
 var (
@@ -149,6 +164,10 @@ var (
 	currentProfiles   []RDPProfile
 	editingProfile    *RDPProfile
 	isEditingExisting bool
+
+	historyHwnd     uintptr
+	historyEntries  []string // parallel to listbox rows; "" for section headers (non-selectable in practice)
+	historySelHosts []string // host to jump to, "" if the row is just a header/info line
 )
 
 func utf16ptr(s string) *uint16 {
@@ -255,6 +274,30 @@ func createCheckbox(parent uintptr, id int, text string, x, y, w, h int32) {
 	)
 }
 
+func createListBox(parent uintptr, id int, x, y, w, h int32) {
+	procCreateWindowExW.Call(
+		0,
+		uintptr(unsafe.Pointer(utf16ptr("LISTBOX"))),
+		0,
+		uintptr(WS_CHILD|WS_VISIBLE|WS_BORDER|WS_TABSTOP|WS_VSCROLL|LBS_NOTIFY),
+		uintptr(x), uintptr(y), uintptr(w), uintptr(h),
+		parent, uintptr(id), hInstance, 0,
+	)
+}
+
+func listReset(hwndParent uintptr, id int) {
+	procSendDlgItemMessageW.Call(hwndParent, uintptr(id), LB_RESETCONTENT, 0, 0)
+}
+
+func listAddString(hwndParent uintptr, id int, text string) {
+	procSendDlgItemMessageW.Call(hwndParent, uintptr(id), LB_ADDSTRING, 0, uintptr(unsafe.Pointer(utf16ptr(text))))
+}
+
+func listGetSel(hwndParent uintptr, id int) int {
+	ret, _, _ := procSendDlgItemMessageW.Call(hwndParent, uintptr(id), LB_GETCURSEL, 0, 0)
+	return int(int32(ret))
+}
+
 // ==================== Entry point ====================
 
 // CreateMainWindow is the entry point called from main.go
@@ -268,10 +311,12 @@ func CreateMainWindow(database *Database, executor *RDPExecutor) error {
 	mainProc := syscall.NewCallback(mainWndProc)
 	editProc := syscall.NewCallback(editWndProc)
 	settingsProc := syscall.NewCallback(settingsWndProc)
+	historyProc := syscall.NewCallback(historyWndProc)
 
 	registerClass("RDPMainWindowClass", mainProc)
 	registerClass("RDPEditWindowClass", editProc)
 	registerClass("RDPSettingsWindowClass", settingsProc)
+	registerClass("RDPHistoryWindowClass", historyProc)
 
 	hosts, _ := GetSystemHostsWithDB(db)
 	sort.Strings(hosts)
@@ -336,6 +381,7 @@ func mainWndProc(hwnd uintptr, msg uint32, wparam, lparam uintptr) uintptr {
 		createButton(hwnd, ID_DELETE, "Delete", 345, 95, 95, 30)
 
 		createButton(hwnd, ID_SETTINGS, "Global Settings", 15, 135, 165, 30)
+		createButton(hwnd, ID_HISTORY, "Connection History", 190, 135, 165, 30)
 
 		createLabel(hwnd, "Tip: double-click a host in the list to select it, then pick a username.", 15, 180, 440, 40)
 
@@ -360,6 +406,8 @@ func mainWndProc(hwnd uintptr, msg uint32, wparam, lparam uintptr) uintptr {
 				onDeleteClicked(hwnd)
 			case ID_SETTINGS:
 				openSettingsWindow(hwnd)
+			case ID_HISTORY:
+				openHistoryWindow(hwnd)
 			}
 		}
 		return 0
@@ -717,6 +765,155 @@ func settingsWndProc(hwnd uintptr, msg uint32, wparam, lparam uintptr) uintptr {
 
 	ret, _, _ := procDefWindowProcW.Call(hwnd, uintptr(msg), wparam, lparam)
 	return ret
+}
+
+// ==================== Connection history window ====================
+
+func openHistoryWindow(owner uintptr) {
+	procEnableWindow.Call(owner, 0)
+
+	historyHwnd, _, _ = procCreateWindowExW.Call(
+		0,
+		uintptr(unsafe.Pointer(utf16ptr("RDPHistoryWindowClass"))),
+		uintptr(unsafe.Pointer(utf16ptr("Connection History"))),
+		uintptr(WS_OVERLAPPEDWINDOW),
+		220, 150, 520, 480,
+		owner, 0, hInstance, 0,
+	)
+
+	procShowWindow.Call(historyHwnd, SW_SHOW)
+	procUpdateWindow.Call(historyHwnd)
+}
+
+func historyWndProc(hwnd uintptr, msg uint32, wparam, lparam uintptr) uintptr {
+	switch msg {
+	case WM_CREATE:
+		createListBox(hwnd, ID_H_LIST, 15, 15, 470, 370)
+		createButton(hwnd, ID_H_CLOSE, "Close", 195, 400, 100, 32)
+		populateHistoryList(hwnd)
+		return 0
+
+	case WM_COMMAND:
+		id := int(loword(wparam))
+		code := int(hiword(wparam))
+
+		if id == ID_H_LIST && code == LBN_DBLCLK {
+			onHistoryDoubleClick(hwnd)
+		} else if code == BN_CLICKED && id == ID_H_CLOSE {
+			procDestroyWindow.Call(hwnd)
+		}
+		return 0
+
+	case WM_CLOSE:
+		procDestroyWindow.Call(hwnd)
+		return 0
+
+	case WM_DESTROY:
+		procEnableWindow.Call(mainHwnd, 1)
+		procSetForegroundWindow.Call(mainHwnd)
+		return 0
+	}
+
+	ret, _, _ := procDefWindowProcW.Call(hwnd, uintptr(msg), wparam, lparam)
+	return ret
+}
+
+// populateHistoryList fills the list with three sections:
+//  1. Hosts saved in our own profile database
+//  2. Hosts found in the Windows/mstsc.exe registry history (not already in our DB)
+//  3. Recent connections made through this program (with timestamp)
+//
+// historySelHosts is kept parallel to the listbox rows: a non-empty value means
+// double-clicking that row should jump to that host in the main window.
+func populateHistoryList(hwnd uintptr) {
+	listReset(hwnd, ID_H_LIST)
+	historySelHosts = nil
+
+	addRow := func(text, host string) {
+		listAddString(hwnd, ID_H_LIST, text)
+		historySelHosts = append(historySelHosts, host)
+	}
+
+	dbHosts, _ := db.GetAllHosts()
+	sysHosts, _ := GetSystemHosts()
+
+	dbHostSet := make(map[string]bool)
+	for _, h := range dbHosts {
+		dbHostSet[h] = true
+	}
+
+	addRow("=== Saved Profiles ===", "")
+	if len(dbHosts) == 0 {
+		addRow("  (none saved yet)", "")
+	}
+	for _, h := range dbHosts {
+		addRow("  "+h, h)
+	}
+
+	addRow("", "")
+	addRow("=== Windows RDP History (mstsc.exe) ===", "")
+	newSysHosts := 0
+	for _, h := range sysHosts {
+		if dbHostSet[h] {
+			continue // already listed above
+		}
+		addRow("  "+h, h)
+		newSysHosts++
+	}
+	if newSysHosts == 0 {
+		addRow("  (none found, or none new)", "")
+	}
+
+	addRow("", "")
+	addRow("=== Recent Connections (this app) ===", "")
+	history := db.GetHistory()
+	if len(history) == 0 {
+		addRow("  (no connections recorded yet)", "")
+	} else {
+		// show most recent first
+		for i := len(history) - 1; i >= 0; i-- {
+			e := history[i]
+			addRow("  "+e.ConnectedAt+"  "+e.Username+"@"+e.Host, e.Host)
+		}
+	}
+}
+
+func onHistoryDoubleClick(hwnd uintptr) {
+	idx := listGetSel(hwnd, ID_H_LIST)
+	if idx < 0 || idx >= len(historySelHosts) {
+		return
+	}
+
+	host := historySelHosts[idx]
+	if host == "" {
+		return // header / info row, not selectable
+	}
+
+	selectHostInMainWindow(host)
+	procDestroyWindow.Call(hwnd)
+}
+
+// selectHostInMainWindow makes sure host is present in the main window's host
+// combo, selects it, and refreshes the username list for it.
+func selectHostInMainWindow(host string) {
+	found := false
+	for _, h := range hostList {
+		if h == host {
+			found = true
+			break
+		}
+	}
+	if !found {
+		hostList = append(hostList, host)
+		sort.Strings(hostList)
+		comboReset(mainHwnd, ID_HOST_COMBO)
+		for _, h := range hostList {
+			comboAddString(mainHwnd, ID_HOST_COMBO, h)
+		}
+	}
+
+	selectComboByText(mainHwnd, ID_HOST_COMBO, host)
+	onHostChanged(mainHwnd)
 }
 
 // ==================== Small helpers ====================
