@@ -1,7 +1,9 @@
 package main
 
 import (
+	"fmt"
 	"sort"
+	"sync"
 	"syscall"
 	"unsafe"
 )
@@ -32,6 +34,8 @@ var (
 	procEnableWindow        = user32.NewProc("EnableWindow")
 	procSetForegroundWindow = user32.NewProc("SetForegroundWindow")
 	procMessageBoxW         = user32.NewProc("MessageBoxW")
+	procPostMessageW        = user32.NewProc("PostMessageW")
+	procLoadIconW           = user32.NewProc("LoadIconW")
 )
 
 type WNDCLASSEXW struct {
@@ -82,6 +86,9 @@ const (
 	WM_DESTROY = 0x0002
 	WM_CLOSE   = 0x0010
 	WM_COMMAND = 0x0111
+
+	WM_APP           = 0x8000
+	WM_HISTORY_READY = WM_APP + 1
 
 	CB_GETLBTEXT    = 0x0148
 	CB_ADDSTRING    = 0x0143
@@ -166,8 +173,11 @@ var (
 	isEditingExisting bool
 
 	historyHwnd     uintptr
-	historyEntries  []string // parallel to listbox rows; "" for section headers (non-selectable in practice)
 	historySelHosts []string // host to jump to, "" if the row is just a header/info line
+
+	historyDataMu    sync.Mutex
+	historyDataRows  []string
+	historyDataHosts []string
 )
 
 func utf16ptr(s string) *uint16 {
@@ -313,10 +323,12 @@ func CreateMainWindow(database *Database, executor *RDPExecutor) error {
 	settingsProc := syscall.NewCallback(settingsWndProc)
 	historyProc := syscall.NewCallback(historyWndProc)
 
-	registerClass("RDPMainWindowClass", mainProc)
-	registerClass("RDPEditWindowClass", editProc)
-	registerClass("RDPSettingsWindowClass", settingsProc)
-	registerClass("RDPHistoryWindowClass", historyProc)
+	appIcon, _, _ := procLoadIconW.Call(hInstance, 1) // resource ID 1, embedded via rsrc_windows_amd64.syso
+
+	registerClass("RDPMainWindowClass", mainProc, appIcon)
+	registerClass("RDPEditWindowClass", editProc, appIcon)
+	registerClass("RDPSettingsWindowClass", settingsProc, appIcon)
+	registerClass("RDPHistoryWindowClass", historyProc, appIcon)
 
 	hosts, _ := GetSystemHostsWithDB(db)
 	sort.Strings(hosts)
@@ -338,7 +350,7 @@ func CreateMainWindow(database *Database, executor *RDPExecutor) error {
 	return nil
 }
 
-func registerClass(name string, proc uintptr) {
+func registerClass(name string, proc uintptr, icon uintptr) {
 	curCursor, _, _ := procLoadCursorW.Call(0, 32512) // IDC_ARROW
 
 	var wc WNDCLASSEXW
@@ -348,6 +360,8 @@ func registerClass(name string, proc uintptr) {
 	wc.hCursor = curCursor
 	wc.hbrBackground = 6 // COLOR_WINDOW + 1
 	wc.lpszClassName = utf16ptr(name)
+	wc.hIcon = icon
+	wc.hIconSm = icon
 
 	procRegisterClassExW.Call(uintptr(unsafe.Pointer(&wc)))
 }
@@ -790,7 +804,28 @@ func historyWndProc(hwnd uintptr, msg uint32, wparam, lparam uintptr) uintptr {
 	case WM_CREATE:
 		createListBox(hwnd, ID_H_LIST, 15, 15, 470, 370)
 		createButton(hwnd, ID_H_CLOSE, "Close", 195, 400, 100, 32)
-		populateHistoryList(hwnd)
+		listAddString(hwnd, ID_H_LIST, "Loading...")
+
+		// IMPORTANT: reading Windows registry history shells out to reg.exe.
+		// Doing that synchronously on the UI thread can freeze the whole app
+		// (a GUI-subsystem process spawning a console process can block on
+		// console setup that itself needs the message loop pumped). So the
+		// actual work happens in a goroutine, and the result is delivered
+		// back via a posted window message.
+		go loadHistoryDataAsync(hwnd)
+		return 0
+
+	case WM_HISTORY_READY:
+		historyDataMu.Lock()
+		rows := historyDataRows
+		hosts := historyDataHosts
+		historyDataMu.Unlock()
+
+		listReset(hwnd, ID_H_LIST)
+		for _, r := range rows {
+			listAddString(hwnd, ID_H_LIST, r)
+		}
+		historySelHosts = hosts
 		return 0
 
 	case WM_COMMAND:
@@ -818,24 +853,39 @@ func historyWndProc(hwnd uintptr, msg uint32, wparam, lparam uintptr) uintptr {
 	return ret
 }
 
-// populateHistoryList fills the list with three sections:
-//  1. Hosts saved in our own profile database
+// loadHistoryDataAsync runs on a background goroutine (NOT the UI thread) and
+// builds the full list of rows to display, including the potentially slow
+// registry/reg.exe lookups. It then posts WM_HISTORY_READY to have the UI
+// thread pick up the result and populate the listbox.
+func loadHistoryDataAsync(hwnd uintptr) {
+	rows, hosts := buildHistoryRows()
+
+	historyDataMu.Lock()
+	historyDataRows = rows
+	historyDataHosts = hosts
+	historyDataMu.Unlock()
+
+	procPostMessageW.Call(hwnd, uintptr(WM_HISTORY_READY), 0, 0)
+}
+
+// buildHistoryRows assembles three sections:
+//  1. Hosts saved in our own profile database (host + username per row)
 //  2. Hosts found in the Windows/mstsc.exe registry history (not already in our DB)
 //  3. Recent connections made through this program (with timestamp)
 //
-// historySelHosts is kept parallel to the listbox rows: a non-empty value means
-// double-clicking that row should jump to that host in the main window.
-func populateHistoryList(hwnd uintptr) {
-	listReset(hwnd, ID_H_LIST)
-	historySelHosts = nil
+// Returns the display rows and a parallel slice of "jump to host" values
+// (empty string for header/info rows that aren't selectable).
+func buildHistoryRows() ([]string, []string) {
+	var rows []string
+	var hosts []string
 
 	addRow := func(text, host string) {
-		listAddString(hwnd, ID_H_LIST, text)
-		historySelHosts = append(historySelHosts, host)
+		rows = append(rows, text)
+		hosts = append(hosts, host)
 	}
 
 	dbHosts, _ := db.GetAllHosts()
-	sysHosts, _ := GetSystemHosts()
+	sysHosts, _ := GetSystemHosts() // shells out to reg.exe - safe here, we're off the UI thread
 
 	dbHostSet := make(map[string]bool)
 	for _, h := range dbHosts {
@@ -847,7 +897,14 @@ func populateHistoryList(hwnd uintptr) {
 		addRow("  (none saved yet)", "")
 	}
 	for _, h := range dbHosts {
-		addRow("  "+h, h)
+		profiles, _ := db.GetProfilesByHost(h)
+		if len(profiles) == 0 {
+			addRow("  "+h, h)
+			continue
+		}
+		for _, p := range profiles {
+			addRow(fmt.Sprintf("  %s   (user: %s)", h, p.Username), h)
+		}
 	}
 
 	addRow("", "")
@@ -876,6 +933,8 @@ func populateHistoryList(hwnd uintptr) {
 			addRow("  "+e.ConnectedAt+"  "+e.Username+"@"+e.Host, e.Host)
 		}
 	}
+
+	return rows, hosts
 }
 
 func onHistoryDoubleClick(hwnd uintptr) {
