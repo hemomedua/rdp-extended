@@ -98,6 +98,44 @@ func parseRegSubkeys(output string, parentKey string) []string {
 	return hosts
 }
 
+// GetServerUsernameHints reads the "UsernameHint" value Windows stores per
+// server under the Servers key (the username mstsc.exe last used to connect).
+// Done as a single recursive query instead of one call per host.
+func GetServerUsernameHints() map[string]string {
+	hints := make(map[string]string)
+
+	out, err := exec.Command("reg", "query", regServersKey, "/s").Output()
+	if err != nil {
+		return hints
+	}
+
+	prefix := regServersKey + `\`
+	currentHost := ""
+
+	for _, line := range strings.Split(string(out), "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			continue
+		}
+
+		if strings.HasPrefix(trimmed, prefix) {
+			currentHost = strings.TrimSpace(strings.TrimPrefix(trimmed, prefix))
+			continue
+		}
+
+		if currentHost == "" {
+			continue
+		}
+
+		fields := strings.Fields(trimmed)
+		if len(fields) >= 3 && fields[0] == "UsernameHint" {
+			hints[currentHost] = strings.Join(fields[2:], " ")
+		}
+	}
+
+	return hints
+}
+
 // GetSystemHostsWithDB merges system (registry) hosts with hosts saved in our
 // own database, deduplicated.
 func GetSystemHostsWithDB(db *Database) ([]string, error) {

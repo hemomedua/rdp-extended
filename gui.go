@@ -2,7 +2,9 @@ package main
 
 import (
 	"fmt"
+	"runtime"
 	"sort"
+	"strings"
 	"sync"
 	"syscall"
 	"unsafe"
@@ -77,6 +79,7 @@ const (
 	WS_VSCROLL          = 0x00200000
 
 	CBS_DROPDOWNLIST = 0x0003
+	CBS_DROPDOWN     = 0x0002
 	ES_PASSWORD      = 0x0020
 	BS_AUTOCHECKBOX  = 0x0003
 
@@ -95,6 +98,7 @@ const (
 	CB_RESETCONTENT = 0x014B
 	CB_GETCURSEL    = 0x0147
 	CB_SETCURSEL    = 0x014E
+	CB_GETCOUNT     = 0x0146
 
 	LB_ADDSTRING    = 0x0180
 	LB_RESETCONTENT = 0x0184
@@ -104,7 +108,11 @@ const (
 	LBS_NOTIFY      = 0x0001
 	LBN_DBLCLK      = 2
 
-	CBN_SELCHANGE = 5
+	// NOTE: CBN_SELCHANGE is 1, NOT 5 (5 is CBN_EDITCHANGE - a different
+	// notification, sent when the user types in an editable combo's text
+	// box). Using the wrong value here meant the host-selection handler
+	// was effectively never invoked when picking an item from the list.
+	CBN_SELCHANGE = 1
 	BN_CLICKED    = 0
 
 	MB_OK        = 0x00000000
@@ -174,10 +182,15 @@ var (
 
 	historyHwnd     uintptr
 	historySelHosts []string // host to jump to, "" if the row is just a header/info line
+	historySelUsers []string // username to prefill, "" if none
 
 	historyDataMu    sync.Mutex
 	historyDataRows  []string
 	historyDataHosts []string
+	historyDataUsers []string
+
+	usernameHintsMu sync.Mutex
+	usernameHints   map[string]string // host -> last-used username, from registry (best effort)
 )
 
 func utf16ptr(s string) *uint16 {
@@ -210,6 +223,10 @@ func getDlgText(hwndParent uintptr, id int) string {
 	buf := make([]uint16, 512)
 	procGetDlgItemTextW.Call(hwndParent, uintptr(id), uintptr(unsafe.Pointer(&buf[0])), uintptr(len(buf)))
 	return syscall.UTF16ToString(buf)
+}
+
+func setDlgText(hwndParent uintptr, id int, text string) {
+	procSetDlgItemTextW.Call(hwndParent, uintptr(id), uintptr(unsafe.Pointer(utf16ptr(text))))
 }
 
 func setChecked(hwndParent uintptr, id int, checked bool) {
@@ -257,6 +274,21 @@ func createCombo(parent uintptr, id int, x, y, w, h int32) {
 		uintptr(unsafe.Pointer(utf16ptr("COMBOBOX"))),
 		0,
 		uintptr(WS_CHILD|WS_VISIBLE|WS_TABSTOP|WS_VSCROLL|CBS_DROPDOWNLIST),
+		uintptr(x), uintptr(y), uintptr(w), uintptr(h),
+		parent, uintptr(id), hInstance, 0,
+	)
+}
+
+// createComboEditable creates a combo box that both offers a dropdown list
+// AND allows the user to type free-form text into it (CBS_DROPDOWN instead
+// of CBS_DROPDOWNLIST). Used for Host/Username fields so a host:port or an
+// arbitrary username can be typed directly, not just picked from a list.
+func createComboEditable(parent uintptr, id int, x, y, w, h int32) {
+	procCreateWindowExW.Call(
+		0,
+		uintptr(unsafe.Pointer(utf16ptr("COMBOBOX"))),
+		0,
+		uintptr(WS_CHILD|WS_VISIBLE|WS_TABSTOP|WS_VSCROLL|CBS_DROPDOWN),
 		uintptr(x), uintptr(y), uintptr(w), uintptr(h),
 		parent, uintptr(id), hInstance, 0,
 	)
@@ -312,6 +344,15 @@ func listGetSel(hwndParent uintptr, id int) int {
 
 // CreateMainWindow is the entry point called from main.go
 func CreateMainWindow(database *Database, executor *RDPExecutor) error {
+	// CRITICAL: Win32 windows and message queues are affine to the OS thread
+	// that created them. Go's scheduler can otherwise migrate this goroutine
+	// to a different OS thread after any blocking call, which silently
+	// corrupts window/message handling and causes exactly the kind of
+	// intermittent, hard-to-reproduce freezes seen when opening child
+	// windows. Pinning to one OS thread for the lifetime of the GUI fixes
+	// this at the root.
+	runtime.LockOSThread()
+
 	db = database
 	rdpExecutor = executor
 
@@ -346,8 +387,30 @@ func CreateMainWindow(database *Database, executor *RDPExecutor) error {
 	procShowWindow.Call(mainHwnd, SW_SHOW)
 	procUpdateWindow.Call(mainHwnd)
 
+	go prefetchUsernameHints() // best-effort, off the UI thread; never blocks startup
+
 	runMessageLoop()
 	return nil
+}
+
+// prefetchUsernameHints loads the registry's per-host "last used username"
+// hints in the background and stores them in a mutex-guarded cache, so the
+// UI thread never has to shell out to reg.exe synchronously (which is what
+// caused freezes previously).
+func prefetchUsernameHints() {
+	hints := GetServerUsernameHints()
+	usernameHintsMu.Lock()
+	usernameHints = hints
+	usernameHintsMu.Unlock()
+}
+
+func getCachedUsernameHint(host string) string {
+	usernameHintsMu.Lock()
+	defer usernameHintsMu.Unlock()
+	if usernameHints == nil {
+		return ""
+	}
+	return usernameHints[host]
 }
 
 func registerClass(name string, proc uintptr, icon uintptr) {
@@ -384,10 +447,10 @@ func mainWndProc(hwnd uintptr, msg uint32, wparam, lparam uintptr) uintptr {
 	switch msg {
 	case WM_CREATE:
 		createLabel(hwnd, "Host:", 15, 20, 80, 20)
-		createCombo(hwnd, ID_HOST_COMBO, 100, 18, 340, 200)
+		createComboEditable(hwnd, ID_HOST_COMBO, 100, 18, 340, 200)
 
 		createLabel(hwnd, "Username:", 15, 55, 80, 20)
-		createCombo(hwnd, ID_USER_COMBO, 100, 53, 340, 200)
+		createComboEditable(hwnd, ID_USER_COMBO, 100, 53, 340, 200)
 
 		createButton(hwnd, ID_CONNECT, "Connect", 15, 95, 100, 30)
 		createButton(hwnd, ID_NEW, "New Profile", 125, 95, 100, 30)
@@ -397,9 +460,13 @@ func mainWndProc(hwnd uintptr, msg uint32, wparam, lparam uintptr) uintptr {
 		createButton(hwnd, ID_SETTINGS, "Global Settings", 15, 135, 165, 30)
 		createButton(hwnd, ID_HISTORY, "Connection History", 190, 135, 165, 30)
 
-		createLabel(hwnd, "Tip: double-click a host in the list to select it, then pick a username.", 15, 180, 440, 40)
+		createLabel(hwnd, "Tip: you can type a host (optionally host:port) directly, or pick one from the list.", 15, 180, 440, 40)
 
 		refreshHostCombo(hwnd)
+		if len(hostList) > 0 {
+			setDlgText(hwnd, ID_HOST_COMBO, hostList[0])
+			onHostChanged(hwnd)
+		}
 		return 0
 
 	case WM_COMMAND:
@@ -413,7 +480,7 @@ func mainWndProc(hwnd uintptr, msg uint32, wparam, lparam uintptr) uintptr {
 			case ID_CONNECT:
 				onConnectClicked(hwnd)
 			case ID_NEW:
-				openEditWindow(hwnd, nil)
+				onNewClicked(hwnd)
 			case ID_EDIT:
 				onEditClicked(hwnd)
 			case ID_DELETE:
@@ -451,49 +518,105 @@ func refreshHostCombo(hwnd uintptr) {
 	for _, h := range hostList {
 		comboAddString(hwnd, ID_HOST_COMBO, h)
 	}
-	if len(hostList) > 0 {
-		comboSetSel(hwnd, ID_HOST_COMBO, 0)
-		onHostChanged(hwnd)
-	} else {
-		comboReset(hwnd, ID_USER_COMBO)
-		currentProfiles = nil
-	}
 }
 
 func onHostChanged(hwnd uintptr) {
-	idx := comboGetSel(hwnd, ID_HOST_COMBO)
+	raw := strings.TrimSpace(getDlgText(hwnd, ID_HOST_COMBO))
 	comboReset(hwnd, ID_USER_COMBO)
 	currentProfiles = nil
 
-	if idx < 0 || idx >= len(hostList) {
+	if raw == "" {
 		return
 	}
 
-	host := hostList[idx]
+	host, _, _ := parseHostPort(raw)
+
 	profiles, _ := db.GetProfilesByHost(host)
 	currentProfiles = profiles
 
 	for _, p := range profiles {
 		comboAddString(hwnd, ID_USER_COMBO, p.Username)
 	}
+
 	if len(profiles) > 0 {
 		comboSetSel(hwnd, ID_USER_COMBO, 0)
+		return
+	}
+
+	// No saved profile for this host - offer the registry's last-used
+	// username for it as a convenience, if we know one.
+	if hint := getCachedUsernameHint(host); hint != "" {
+		setDlgText(hwnd, ID_USER_COMBO, hint)
 	}
 }
 
-func getSelectedProfile(hwnd uintptr) *RDPProfile {
-	uidx := comboGetSel(hwnd, ID_USER_COMBO)
-	if uidx < 0 || uidx >= len(currentProfiles) {
-		return nil
+// parseHostPort splits "host" or "host:port" into its parts. hasPort is
+// false (and port is 0) when no valid numeric port suffix is present, in
+// which case host is returned unchanged (e.g. "2001:db8::1" style inputs
+// are left alone rather than misparsed - we only treat the suffix after the
+// LAST colon as a port if it's a plausible port number).
+func parseHostPort(input string) (host string, port int, hasPort bool) {
+	input = strings.TrimSpace(input)
+	idx := strings.LastIndex(input, ":")
+	if idx <= 0 || idx == len(input)-1 {
+		return input, 0, false
 	}
-	p := currentProfiles[uidx]
-	return &p
+
+	portStr := input[idx+1:]
+	p, ok := atoi(portStr)
+	if !ok || p <= 0 || p > 65535 {
+		return input, 0, false
+	}
+
+	return input[:idx], p, true
+}
+
+// buildConnectionProfile reads whatever is currently in the Host/Username
+// fields (typed or picked from the dropdown) and produces a profile to
+// connect with: an exact saved profile if host+username match one, or a
+// sensible quick-connect profile (no stored password - mstsc will prompt).
+func buildConnectionProfile(hwnd uintptr) (*RDPProfile, error) {
+	rawHost := strings.TrimSpace(getDlgText(hwnd, ID_HOST_COMBO))
+	if rawHost == "" {
+		return nil, fmt.Errorf("please enter a host to connect to")
+	}
+
+	host, port, hasPort := parseHostPort(rawHost)
+	username := strings.TrimSpace(getDlgText(hwnd, ID_USER_COMBO))
+
+	if username != "" {
+		for _, p := range currentProfiles {
+			if p.Host == host && p.Username == username {
+				pc := p
+				if hasPort {
+					pc.Port = port
+				}
+				return &pc, nil
+			}
+		}
+	}
+
+	profile := &RDPProfile{
+		Host:             host,
+		Port:             3389,
+		Username:         username,
+		Resolution:       "1920x1080",
+		ClipboardEnabled: true,
+		DisksEnabled:     true,
+		DisksRedirect:    "all",
+		DisksDynamic:     true,
+		ProxyMode:        "direct",
+	}
+	if hasPort {
+		profile.Port = port
+	}
+	return profile, nil
 }
 
 func onConnectClicked(hwnd uintptr) {
-	profile := getSelectedProfile(hwnd)
-	if profile == nil {
-		msgBox("Please select a host and username first.", "RDP+ Extended", MB_OK|MB_ICONERROR)
+	profile, err := buildConnectionProfile(hwnd)
+	if err != nil {
+		msgBox(err.Error(), "RDP+ Extended", MB_OK|MB_ICONERROR)
 		return
 	}
 
@@ -503,35 +626,88 @@ func onConnectClicked(hwnd uintptr) {
 	}
 }
 
+func onNewClicked(hwnd uintptr) {
+	prefill := &RDPProfile{
+		Port:             3389,
+		Resolution:       "1920x1080",
+		ClipboardEnabled: true,
+		DisksEnabled:     true,
+		DisksRedirect:    "all",
+		DisksDynamic:     true,
+		ProxyMode:        "direct",
+	}
+
+	rawHost := strings.TrimSpace(getDlgText(hwnd, ID_HOST_COMBO))
+	if rawHost != "" {
+		host, port, hasPort := parseHostPort(rawHost)
+		prefill.Host = host
+		if hasPort {
+			prefill.Port = port
+		}
+	}
+	prefill.Username = strings.TrimSpace(getDlgText(hwnd, ID_USER_COMBO))
+
+	openEditWindow(hwnd, prefill)
+}
+
 func onEditClicked(hwnd uintptr) {
-	profile := getSelectedProfile(hwnd)
-	if profile == nil {
-		msgBox("Please select a profile to edit.", "RDP+ Extended", MB_OK|MB_ICONERROR)
+	rawHost := strings.TrimSpace(getDlgText(hwnd, ID_HOST_COMBO))
+	if rawHost == "" {
+		msgBox("Please enter or select a host first.", "RDP+ Extended", MB_OK|MB_ICONERROR)
 		return
 	}
-	openEditWindow(hwnd, profile)
+
+	host, port, hasPort := parseHostPort(rawHost)
+	username := strings.TrimSpace(getDlgText(hwnd, ID_USER_COMBO))
+
+	prefill := &RDPProfile{
+		Host:             host,
+		Port:             3389,
+		Username:         username,
+		Resolution:       "1920x1080",
+		ClipboardEnabled: true,
+		DisksEnabled:     true,
+		DisksRedirect:    "all",
+		DisksDynamic:     true,
+		ProxyMode:        "direct",
+	}
+	if hasPort {
+		prefill.Port = port
+	}
+
+	openEditWindow(hwnd, prefill)
 }
 
 func onDeleteClicked(hwnd uintptr) {
-	profile := getSelectedProfile(hwnd)
-	if profile == nil {
-		msgBox("Please select a profile to delete.", "RDP+ Extended", MB_OK|MB_ICONERROR)
+	rawHost := strings.TrimSpace(getDlgText(hwnd, ID_HOST_COMBO))
+	host, _, _ := parseHostPort(rawHost)
+	username := strings.TrimSpace(getDlgText(hwnd, ID_USER_COMBO))
+
+	if host == "" || username == "" {
+		msgBox("Enter/select both a host and a username to delete.", "RDP+ Extended", MB_OK|MB_ICONERROR)
 		return
 	}
 
-	if err := db.DeleteProfile(profile.Host, profile.Username); err != nil {
+	existing, _ := db.GetProfile(host, username)
+	if existing == nil {
+		msgBox("No saved profile matches this host and username.", "RDP+ Extended", MB_OK|MB_ICONERROR)
+		return
+	}
+
+	if err := db.DeleteProfile(host, username); err != nil {
 		msgBox("Error deleting profile: "+err.Error(), "RDP+ Extended", MB_OK|MB_ICONERROR)
 		return
 	}
 
 	refreshHostCombo(hwnd)
+	onHostChanged(hwnd)
 }
 
 // ==================== Edit / New profile window ====================
 
-func openEditWindow(owner uintptr, profile *RDPProfile) {
-	if profile == nil {
-		editingProfile = &RDPProfile{
+func openEditWindow(owner uintptr, prefill *RDPProfile) {
+	if prefill == nil {
+		prefill = &RDPProfile{
 			Port:             3389,
 			Resolution:       "1920x1080",
 			ClipboardEnabled: true,
@@ -540,11 +716,19 @@ func openEditWindow(owner uintptr, profile *RDPProfile) {
 			DisksDynamic:     true,
 			ProxyMode:        "direct",
 		}
-		isEditingExisting = false
-	} else {
-		p := *profile
+	}
+
+	// Decide "new vs existing" by what's actually saved, not by what the
+	// caller happened to pass in - this way prefilled-but-unsaved data
+	// (typed host/user not yet in the DB) correctly opens as "New Profile".
+	if existing, _ := db.GetProfile(prefill.Host, prefill.Username); existing != nil {
+		p := *existing
 		editingProfile = &p
 		isEditingExisting = true
+	} else {
+		p := *prefill
+		editingProfile = &p
+		isEditingExisting = false
 	}
 
 	procEnableWindow.Call(owner, 0)
@@ -690,6 +874,7 @@ func saveEditWindow(hwnd uintptr) {
 
 	procDestroyWindow.Call(hwnd)
 	refreshHostCombo(mainHwnd)
+	jumpToHostInMainWindow(editingProfile.Host, editingProfile.Username)
 }
 
 func deleteFromEditWindow(hwnd uintptr) {
@@ -705,6 +890,7 @@ func deleteFromEditWindow(hwnd uintptr) {
 
 	procDestroyWindow.Call(hwnd)
 	refreshHostCombo(mainHwnd)
+	onHostChanged(mainHwnd)
 }
 
 // ==================== Settings window ====================
@@ -819,6 +1005,7 @@ func historyWndProc(hwnd uintptr, msg uint32, wparam, lparam uintptr) uintptr {
 		historyDataMu.Lock()
 		rows := historyDataRows
 		hosts := historyDataHosts
+		users := historyDataUsers
 		historyDataMu.Unlock()
 
 		listReset(hwnd, ID_H_LIST)
@@ -826,6 +1013,7 @@ func historyWndProc(hwnd uintptr, msg uint32, wparam, lparam uintptr) uintptr {
 			listAddString(hwnd, ID_H_LIST, r)
 		}
 		historySelHosts = hosts
+		historySelUsers = users
 		return 0
 
 	case WM_COMMAND:
@@ -858,11 +1046,12 @@ func historyWndProc(hwnd uintptr, msg uint32, wparam, lparam uintptr) uintptr {
 // registry/reg.exe lookups. It then posts WM_HISTORY_READY to have the UI
 // thread pick up the result and populate the listbox.
 func loadHistoryDataAsync(hwnd uintptr) {
-	rows, hosts := buildHistoryRows()
+	rows, hosts, users := buildHistoryRows()
 
 	historyDataMu.Lock()
 	historyDataRows = rows
 	historyDataHosts = hosts
+	historyDataUsers = users
 	historyDataMu.Unlock()
 
 	procPostMessageW.Call(hwnd, uintptr(WM_HISTORY_READY), 0, 0)
@@ -870,71 +1059,87 @@ func loadHistoryDataAsync(hwnd uintptr) {
 
 // buildHistoryRows assembles three sections:
 //  1. Hosts saved in our own profile database (host + username per row)
-//  2. Hosts found in the Windows/mstsc.exe registry history (not already in our DB)
+//  2. Hosts found in the Windows/mstsc.exe registry history (not already in
+//     our DB), with a last-used username hint when the registry has one
 //  3. Recent connections made through this program (with timestamp)
 //
-// Returns the display rows and a parallel slice of "jump to host" values
-// (empty string for header/info rows that aren't selectable).
-func buildHistoryRows() ([]string, []string) {
+// Returns the display rows and two parallel slices: the host to jump to,
+// and the username to prefill (both "" for header/info rows).
+func buildHistoryRows() ([]string, []string, []string) {
 	var rows []string
 	var hosts []string
+	var users []string
 
-	addRow := func(text, host string) {
+	addRow := func(text, host, username string) {
 		rows = append(rows, text)
 		hosts = append(hosts, host)
+		users = append(users, username)
 	}
 
 	dbHosts, _ := db.GetAllHosts()
-	sysHosts, _ := GetSystemHosts() // shells out to reg.exe - safe here, we're off the UI thread
+	sysHosts, _ := GetSystemHosts()          // shells out to reg.exe - safe here, off the UI thread
+	hints := GetServerUsernameHints()        // one recursive reg.exe query - also safe here
+	usernameHintsMu.Lock()
+	usernameHints = hints
+	usernameHintsMu.Unlock()
 
 	dbHostSet := make(map[string]bool)
 	for _, h := range dbHosts {
 		dbHostSet[h] = true
 	}
 
-	addRow("=== Saved Profiles ===", "")
+	addRow("=== Saved Profiles ===", "", "")
 	if len(dbHosts) == 0 {
-		addRow("  (none saved yet)", "")
+		addRow("  (none saved yet)", "", "")
 	}
 	for _, h := range dbHosts {
 		profiles, _ := db.GetProfilesByHost(h)
 		if len(profiles) == 0 {
-			addRow("  "+h, h)
+			addRow("  "+h, h, "")
 			continue
 		}
 		for _, p := range profiles {
-			addRow(fmt.Sprintf("  %s   (user: %s)", h, p.Username), h)
+			addRow(fmt.Sprintf("  %s   (user: %s)", h, p.Username), h, p.Username)
 		}
 	}
 
-	addRow("", "")
-	addRow("=== Windows RDP History (mstsc.exe) ===", "")
+	addRow("", "", "")
+	addRow("=== Windows RDP History (mstsc.exe) ===", "", "")
 	newSysHosts := 0
 	for _, h := range sysHosts {
 		if dbHostSet[h] {
 			continue // already listed above
 		}
-		addRow("  "+h, h)
+		bareHost, _, _ := parseHostPort(h)
+		hint := hints[bareHost]
+		if hint == "" {
+			hint = hints[h]
+		}
+		if hint != "" {
+			addRow(fmt.Sprintf("  %s   (user: %s)", h, hint), h, hint)
+		} else {
+			addRow("  "+h, h, "")
+		}
 		newSysHosts++
 	}
 	if newSysHosts == 0 {
-		addRow("  (none found, or none new)", "")
+		addRow("  (none found, or none new)", "", "")
 	}
 
-	addRow("", "")
-	addRow("=== Recent Connections (this app) ===", "")
+	addRow("", "", "")
+	addRow("=== Recent Connections (this app) ===", "", "")
 	history := db.GetHistory()
 	if len(history) == 0 {
-		addRow("  (no connections recorded yet)", "")
+		addRow("  (no connections recorded yet)", "", "")
 	} else {
 		// show most recent first
 		for i := len(history) - 1; i >= 0; i-- {
 			e := history[i]
-			addRow("  "+e.ConnectedAt+"  "+e.Username+"@"+e.Host, e.Host)
+			addRow("  "+e.ConnectedAt+"  "+e.Username+"@"+e.Host, e.Host, e.Username)
 		}
 	}
 
-	return rows, hosts
+	return rows, hosts, users
 }
 
 func onHistoryDoubleClick(hwnd uintptr) {
@@ -948,41 +1153,39 @@ func onHistoryDoubleClick(hwnd uintptr) {
 		return // header / info row, not selectable
 	}
 
-	selectHostInMainWindow(host)
+	username := ""
+	if idx < len(historySelUsers) {
+		username = historySelUsers[idx]
+	}
+
+	jumpToHostInMainWindow(host, username)
 	procDestroyWindow.Call(hwnd)
 }
 
-// selectHostInMainWindow makes sure host is present in the main window's host
-// combo, selects it, and refreshes the username list for it.
-func selectHostInMainWindow(host string) {
-	found := false
-	for _, h := range hostList {
-		if h == host {
-			found = true
-			break
-		}
-	}
-	if !found {
-		hostList = append(hostList, host)
-		sort.Strings(hostList)
-		comboReset(mainHwnd, ID_HOST_COMBO)
-		for _, h := range hostList {
-			comboAddString(mainHwnd, ID_HOST_COMBO, h)
-		}
-	}
-
-	selectComboByText(mainHwnd, ID_HOST_COMBO, host)
+// jumpToHostInMainWindow puts host (and, if known, username) directly into
+// the main window's fields and refreshes the username list for that host.
+// Since the host/username combos are editable, we just set their text
+// directly - no need to find-and-select a matching list item.
+func jumpToHostInMainWindow(host, username string) {
+	setDlgText(mainHwnd, ID_HOST_COMBO, host)
 	onHostChanged(mainHwnd)
+
+	if username != "" {
+		setDlgText(mainHwnd, ID_USER_COMBO, username)
+	}
 }
 
 // ==================== Small helpers ====================
 
 func selectComboByText(hwnd uintptr, id int, text string) {
-	for i := 0; i < 20; i++ {
+	countRet, _, _ := procSendDlgItemMessageW.Call(hwnd, uintptr(id), CB_GETCOUNT, 0, 0)
+	count := int(int32(countRet))
+
+	for i := 0; i < count; i++ {
 		buf := make([]uint16, 256)
 		ret, _, _ := procSendDlgItemMessageW.Call(hwnd, uintptr(id), CB_GETLBTEXT, uintptr(i), uintptr(unsafe.Pointer(&buf[0])))
 		if int32(ret) < 0 {
-			break
+			continue
 		}
 		if syscall.UTF16ToString(buf) == text {
 			comboSetSel(hwnd, id, i)
