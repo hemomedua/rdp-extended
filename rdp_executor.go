@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -150,6 +151,32 @@ func resolveProxyAddress(profile *RDPProfile, global *GlobalSettings) string {
 	return ""
 }
 
+// writeRDPFileUTF16 writes content as a Windows .rdp file encoded in
+// UTF-16LE with a BOM. This matters as soon as the content contains any
+// non-ASCII text (a Cyrillic username, for instance): mstsc.exe's own
+// "Save As" produces Unicode .rdp files exactly this way, and a plain
+// UTF-8 file without a BOM gets misparsed byte-by-byte against the wrong
+// code page, corrupting every non-ASCII character - the same "ромбики с
+// вопросом" symptom, just showing up inside mstsc.exe's own window instead
+// of ours.
+func writeRDPFileUTF16(path, content string) error {
+	u16, err := syscall.UTF16FromString(content) // includes a trailing NUL
+	if err != nil {
+		return err
+	}
+
+	buf := make([]byte, 0, 2+2*len(u16))
+	buf = append(buf, 0xFF, 0xFE) // UTF-16LE byte-order mark
+	for _, c := range u16 {
+		if c == 0 {
+			break // stop before the implicit trailing NUL
+		}
+		buf = append(buf, byte(c), byte(c>>8))
+	}
+
+	return os.WriteFile(path, buf, 0644)
+}
+
 // ExecuteRDP launches mstsc.exe for the given profile, applying global
 // defaults for anything the profile doesn't explicitly override.
 func (r *RDPExecutor) ExecuteRDP(profile *RDPProfile) error {
@@ -173,12 +200,12 @@ func (r *RDPExecutor) ExecuteRDP(profile *RDPProfile) error {
 		return fmt.Errorf("could not create temporary .rdp file: %w", err)
 	}
 	tmpPath := tmpFile.Name()
-	if _, err := tmpFile.WriteString(rdpFileContent); err != nil {
-		tmpFile.Close()
+	tmpFile.Close() // we'll rewrite it properly below
+
+	if err := writeRDPFileUTF16(tmpPath, rdpFileContent); err != nil {
 		os.Remove(tmpPath)
 		return fmt.Errorf("could not write .rdp file: %w", err)
 	}
-	tmpFile.Close()
 
 	cmd := exec.Command("mstsc.exe", tmpPath)
 	if err := cmd.Start(); err != nil {

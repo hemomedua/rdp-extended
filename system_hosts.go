@@ -3,12 +3,53 @@ package main
 import (
 	"os/exec"
 	"strings"
+	"syscall"
+	"unsafe"
 )
 
 const (
 	regDefaultKey = `HKEY_CURRENT_USER\Software\Microsoft\Terminal Server Client\Default`
 	regServersKey = `HKEY_CURRENT_USER\Software\Microsoft\Terminal Server Client\Servers`
+
+	cpOEMCP = 1 // CP_OEMCP
 )
+
+var procMultiByteToWideChar = kernel32.NewProc("MultiByteToWideChar")
+
+// decodeOEMBytes converts console output from reg.exe (and other built-in
+// Windows console tools) into a proper Go string. This is NOT optional:
+// when a console program's output is captured through a pipe (exactly what
+// exec.Command().Output() does), Windows encodes non-ASCII text using the
+// OEM code page (e.g. CP866 on a Russian-locale system) - NOT UTF-8. Naively
+// doing string(rawBytes) treats those OEM-encoded bytes as if they were
+// already UTF-8, which corrupts every non-ASCII character (Cyrillic
+// included) into the Unicode replacement character (�) once it flows
+// through any UTF-8-expecting API - exactly the "ромбики с вопросом"
+// symptom. Converting via MultiByteToWideChar(CP_OEMCP, ...) first fixes
+// this at the source.
+func decodeOEMBytes(b []byte) string {
+	if len(b) == 0 {
+		return ""
+	}
+
+	n, _, _ := procMultiByteToWideChar.Call(
+		uintptr(cpOEMCP), 0,
+		uintptr(unsafe.Pointer(&b[0])), uintptr(len(b)),
+		0, 0,
+	)
+	if n == 0 {
+		return string(b) // fallback - better than nothing
+	}
+
+	buf := make([]uint16, n)
+	procMultiByteToWideChar.Call(
+		uintptr(cpOEMCP), 0,
+		uintptr(unsafe.Pointer(&b[0])), uintptr(len(b)),
+		uintptr(unsafe.Pointer(&buf[0])), n,
+	)
+
+	return syscall.UTF16ToString(buf)
+}
 
 // GetSystemHosts retrieves RDP connection history from the Windows registry.
 // It reads two locations used by mstsc.exe:
@@ -20,14 +61,14 @@ func GetSystemHosts() ([]string, error) {
 	// 1) Recently typed hosts (MRU list). NOTE: `reg query` only accepts a single
 	// key argument to list ALL of its values - it does not take multiple /v flags.
 	if out, err := exec.Command("reg", "query", regDefaultKey).Output(); err == nil {
-		for _, host := range parseRegMRUValues(string(out)) {
+		for _, host := range parseRegMRUValues(decodeOEMBytes(out)) {
 			hostMap[host] = true
 		}
 	}
 
 	// 2) Every host ever connected to is stored as a subkey under "Servers".
 	if out, err := exec.Command("reg", "query", regServersKey).Output(); err == nil {
-		for _, host := range parseRegSubkeys(string(out), regServersKey) {
+		for _, host := range parseRegSubkeys(decodeOEMBytes(out), regServersKey) {
 			hostMap[host] = true
 		}
 	}
@@ -112,7 +153,7 @@ func GetServerUsernameHints() map[string]string {
 	prefix := regServersKey + `\`
 	currentHost := ""
 
-	for _, line := range strings.Split(string(out), "\n") {
+	for _, line := range strings.Split(decodeOEMBytes(out), "\n") {
 		trimmed := strings.TrimSpace(line)
 		if trimmed == "" {
 			continue
