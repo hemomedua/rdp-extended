@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"time"
 )
 
 type RDPExecutor struct {
@@ -16,102 +17,208 @@ func NewRDPExecutor(db *Database) *RDPExecutor {
 	return &RDPExecutor{db: db}
 }
 
-// BuildRDPCommand builds mstsc.exe command with parameters
-func (r *RDPExecutor) BuildRDPCommand(profile *RDPProfile) []string {
-	args := []string{}
-
-	// Computer
-	computerArg := fmt.Sprintf("/v:%s:%d", profile.Host, profile.Port)
-	args = append(args, computerArg)
-
-	// Username
-	if profile.Username != "" {
-		args = append(args, fmt.Sprintf("/u:%s", profile.Username))
-	}
-
-	// Password
-	if profile.Password != "" {
-		args = append(args, fmt.Sprintf("/p:%s", profile.Password))
-	}
-
-	// Resolution
-	if profile.Resolution != "" {
-		switch profile.Resolution {
-		case "1024x768":
-			args = append(args, "/w:1024", "/h:768")
-		case "1920x1080":
-			args = append(args, "/w:1920", "/h:1080")
-		case "fullscreen":
-			args = append(args, "/f")
-		case "fit":
-			args = append(args, "/fit")
-		}
-	}
-
-	// Clipboard
-	if profile.ClipboardEnabled {
-		args = append(args, "/o:redirectclipboard:i:1")
-	} else {
-		args = append(args, "/o:redirectclipboard:i:0")
-	}
-
-	// Disks
-	if profile.DisksEnabled {
-		if profile.DisksRedirect == "all" {
-			args = append(args, "/drives")
-		} else if profile.DisksRedirect == "custom" {
-			// User can customize which drives in the profile editor
-			args = append(args, "/drives:c:,d:")
-		}
-	} else {
-		args = append(args, "/nodrives")
-	}
-
-	// Dynamic disks
-	if profile.DisksDynamic {
-		// This is handled by /drives parameter
-	}
-
-	return args
+// resolvedSettings holds the fully-resolved (no more "inherit"/"") settings
+// that will actually be applied to a connection, after merging a profile's
+// own overrides with the global defaults.
+type resolvedSettings struct {
+	Resolution    string // "1920x1080" / "fullscreen" / "fit" / custom "WxH"
+	ColorDepth    string // "15"/"16"/"24"/"32"
+	Clipboard     bool
+	DisksRedirect string // "none"/"all"/"dynamic"
 }
 
-// ExecuteRDP launches mstsc.exe with the built command
-func (r *RDPExecutor) ExecuteRDP(profile *RDPProfile) error {
-	// Check if we need to use SOCKS5 proxy
-	proxyAddress := ""
-	if profile.ProxyMode == "custom" && profile.ProxyAddress != "" {
-		proxyAddress = profile.ProxyAddress
-	} else if profile.ProxyMode == "global" {
-		settings, err := r.db.GetGlobalSettings()
-		if err == nil && settings.GlobalProxyMode == "enabled" {
-			proxyAddress = settings.GlobalProxyAddress
+func resolveSettings(profile *RDPProfile, global *GlobalSettings) resolvedSettings {
+	r := resolvedSettings{
+		Resolution:    global.DefaultResolution,
+		ColorDepth:    global.DefaultColorDepth,
+		Clipboard:     global.DefaultClipboard,
+		DisksRedirect: global.DefaultDisksRedirect,
+	}
+
+	if profile.Resolution != "" {
+		r.Resolution = profile.Resolution
+	}
+	if profile.ColorDepth != "" {
+		r.ColorDepth = profile.ColorDepth
+	}
+	switch profile.ClipboardMode {
+	case "on":
+		r.Clipboard = true
+	case "off":
+		r.Clipboard = false
+	}
+	if profile.DisksRedirect != "" {
+		r.DisksRedirect = profile.DisksRedirect
+	}
+
+	return r
+}
+
+// buildRDPFileContent produces the text of a .rdp connection file. Using a
+// real .rdp file (instead of mstsc.exe command-line flags) is necessary
+// because mstsc.exe's actual supported CLI switches are very limited
+// (/v, /admin, /f, /w, /h, /public, /multimon, /edit, /migrate) - there is
+// NO /u or /p switch on stock Windows, and no CLI way to set color depth,
+// clipboard redirection, or drive redirection mode at all. The .rdp file
+// format supports all of this properly and is the standard mechanism every
+// real RDP manager uses under the hood.
+func buildRDPFileContent(profile *RDPProfile, s resolvedSettings) string {
+	var b strings.Builder
+
+	fmt.Fprintf(&b, "full address:s:%s:%d\r\n", profile.Host, profile.Port)
+	if profile.Username != "" {
+		fmt.Fprintf(&b, "username:s:%s\r\n", profile.Username)
+	}
+
+	switch s.Resolution {
+	case "fullscreen":
+		b.WriteString("screen mode id:i:2\r\n")
+	case "fit":
+		b.WriteString("screen mode id:i:1\r\n")
+		b.WriteString("smart sizing:i:1\r\n")
+	default:
+		w, h, err := ParseResolution(s.Resolution)
+		if err != nil {
+			w, h = 1920, 1080
+		}
+		b.WriteString("screen mode id:i:1\r\n")
+		fmt.Fprintf(&b, "desktopwidth:i:%d\r\n", w)
+		fmt.Fprintf(&b, "desktopheight:i:%d\r\n", h)
+	}
+
+	if bpp, err := strconv.Atoi(s.ColorDepth); err == nil && bpp > 0 {
+		fmt.Fprintf(&b, "session bpp:i:%d\r\n", bpp)
+	}
+
+	if s.Clipboard {
+		b.WriteString("redirectclipboard:i:1\r\n")
+	} else {
+		b.WriteString("redirectclipboard:i:0\r\n")
+	}
+
+	switch s.DisksRedirect {
+	case "all":
+		b.WriteString("redirectdrives:i:1\r\n")
+		b.WriteString("drivestoredirect:s:*\r\n")
+	case "dynamic":
+		// Only drives that get plugged in AFTER the session has started -
+		// nothing that's already present at connection time.
+		b.WriteString("redirectdrives:i:1\r\n")
+		b.WriteString("drivestoredirect:s:DynamicDrives\r\n")
+	default: // "none" or unknown
+		b.WriteString("redirectdrives:i:0\r\n")
+	}
+
+	return b.String()
+}
+
+// stageCredential saves host+username+password into Windows Credential
+// Manager under "TERMSRV/<host>", which mstsc.exe automatically checks
+// before prompting for a password. This is the standard, documented way
+// ("Remember me" in mstsc.exe itself works the same way under the hood) to
+// achieve saved-password auto-login, since .rdp files cannot carry a plain
+// password (only a per-user encrypted blob) and mstsc.exe has no CLI switch
+// for it.
+//
+// NOTE: Windows stores exactly one credential per host this way, not one
+// per (host, username) pair. If several profiles are saved for the same
+// host, whichever one was connected to most recently is the one Windows
+// will offer outside of this app too. Re-staging right before every connect
+// (as done here) makes each Connect click use the right credential in
+// practice.
+func stageCredential(host, username, password string) {
+	if username == "" || password == "" {
+		return
+	}
+	// Best-effort: if cmdkey isn't available or fails, mstsc will just
+	// prompt for a password instead of silently failing the connection.
+	exec.Command("cmdkey", "/generic:TERMSRV/"+host, "/user:"+username, "/pass:"+password).Run()
+}
+
+// resolveProxyAddress figures out which SOCKS5 address (if any) applies to
+// this connection, per-profile override taking precedence over the global
+// one.
+func resolveProxyAddress(profile *RDPProfile, global *GlobalSettings) string {
+	switch profile.ProxyMode {
+	case "custom":
+		return profile.ProxyAddress
+	case "global":
+		if global.GlobalProxyMode == "enabled" {
+			return global.GlobalProxyAddress
 		}
 	}
+	return ""
+}
 
-	// Build command
-	args := r.BuildRDPCommand(profile)
+// ExecuteRDP launches mstsc.exe for the given profile, applying global
+// defaults for anything the profile doesn't explicitly override.
+func (r *RDPExecutor) ExecuteRDP(profile *RDPProfile) error {
+	global, err := r.db.GetGlobalSettings()
+	if err != nil {
+		global = &GlobalSettings{DefaultResolution: "1920x1080", DefaultColorDepth: "32", DefaultClipboard: true, DefaultDisksRedirect: "all"}
+	}
+	resolved := resolveSettings(profile, global)
 
-	// If proxy is needed, we would need to handle it differently
-	// For now, we launch mstsc.exe directly (SOCKS5 proxying would require
-	// a middleware or routing table manipulation on Windows)
-	if proxyAddress != "" {
-		// TODO: Implement SOCKS5 proxy handling via SetupAPI or WinDivert
-		// For now, just log that proxy would be used
-		fmt.Printf("Note: SOCKS5 proxy %s would be used for this connection\n", proxyAddress)
+	stageCredential(profile.Host, profile.Username, profile.Password)
+
+	// SOCKS5 proxy is stored per-profile/globally but mstsc.exe has no
+	// built-in generic SOCKS5 support, so it is not yet actually applied to
+	// the connection - tracked as a known gap, see project notes.
+	_ = resolveProxyAddress(profile, global)
+
+	rdpFileContent := buildRDPFileContent(profile, resolved)
+
+	tmpFile, err := os.CreateTemp("", "rdpext-*.rdp")
+	if err != nil {
+		return fmt.Errorf("could not create temporary .rdp file: %w", err)
+	}
+	tmpPath := tmpFile.Name()
+	if _, err := tmpFile.WriteString(rdpFileContent); err != nil {
+		tmpFile.Close()
+		os.Remove(tmpPath)
+		return fmt.Errorf("could not write .rdp file: %w", err)
+	}
+	tmpFile.Close()
+
+	cmd := exec.Command("mstsc.exe", tmpPath)
+	if err := cmd.Start(); err != nil {
+		os.Remove(tmpPath)
+		return err
 	}
 
-	// Execute mstsc.exe
-	cmd := exec.Command("mstsc.exe", args...)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
+	// mstsc.exe only needs the file at launch, not for the life of the
+	// session - clean it up shortly after so it doesn't linger on disk.
+	go func(path string) {
+		time.Sleep(15 * time.Second)
+		os.Remove(path)
+	}(tmpPath)
 
-	// Record connection history
 	r.db.RecordConnection(profile.Host, profile.Username)
 
-	return cmd.Start() // Use Start() to not wait for the RDP window to close
+	return nil
 }
 
-// ParseResolution parses custom resolution strings like "1920x1080"
+// GetResolutionOptions returns predefined resolution choices for dropdowns.
+func GetResolutionOptions() []string {
+	return []string{
+		"1024x768",
+		"1280x1024",
+		"1366x768",
+		"1440x900",
+		"1600x1200",
+		"1920x1080",
+		"2560x1440",
+		"fullscreen",
+		"fit",
+	}
+}
+
+// GetColorDepthOptions returns supported RDP color depths.
+func GetColorDepthOptions() []string {
+	return []string{"15", "16", "24", "32"}
+}
+
+// ParseResolution parses resolution strings like "1920x1080".
 func ParseResolution(res string) (int, int, error) {
 	parts := strings.Split(res, "x")
 	if len(parts) != 2 {
@@ -129,19 +236,4 @@ func ParseResolution(res string) (int, int, error) {
 	}
 
 	return width, height, nil
-}
-
-// GetResolutionOptions returns predefined resolution options
-func GetResolutionOptions() []string {
-	return []string{
-		"1024x768",
-		"1280x1024",
-		"1366x768",
-		"1440x900",
-		"1600x1200",
-		"1920x1080",
-		"2560x1440",
-		"fullscreen",
-		"fit",
-	}
 }

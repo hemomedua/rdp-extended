@@ -25,24 +25,36 @@ type HistoryEntry struct {
 }
 
 type RDPProfile struct {
-	ID               int
-	Host             string
-	Port             int
-	Username         string
-	Password         string
-	Resolution       string // "1024x768", "1920x1080", "fullscreen", "custom"
-	ClipboardEnabled bool
-	DisksEnabled     bool
-	DisksRedirect    string // "all", "none", "custom"
-	DisksDynamic     bool   // redirection drives plugged in later
-	ProxyMode        string // "direct", "global", "custom"
-	ProxyAddress     string // host:port for custom
+	ID           int
+	Host         string
+	Port         int
+	Username     string
+	Password     string
+	Resolution   string // "" = inherit global default; else "1024x768"/"1920x1080"/.../"fullscreen"/"fit"/custom "WxH"
+	ColorDepth   string // "" = inherit; else "15"/"16"/"24"/"32"
+	ClipboardMode string // "" = inherit; "on"; "off"
+	DisksRedirect string // "" = inherit; "none"; "all"; "dynamic" (only drives attached after the session starts)
+	ProxyMode    string // "direct", "global", "custom"
+	ProxyAddress string // host:port for custom
 }
 
 type GlobalSettings struct {
 	GlobalProxyMode    string `json:"global_proxy_mode"`    // "disabled", "enabled"
 	GlobalProxyAddress string `json:"global_proxy_address"` // host:port
+
+	DefaultResolution    string `json:"default_resolution"`     // concrete value, e.g. "1920x1080", "fullscreen", "fit"
+	DefaultColorDepth    string `json:"default_color_depth"`    // "15"/"16"/"24"/"32"
+	DefaultClipboard     bool   `json:"default_clipboard"`
+	DefaultDisksRedirect string `json:"default_disks_redirect"` // "none"/"all"/"dynamic"
+
+	// SettingsVersion lets us tell a freshly-created settings object (which
+	// has correct built-in defaults) apart from one loaded from an older
+	// database file that predates these fields (which would otherwise read
+	// back as zero-valued/false). See GetGlobalSettings.
+	SettingsVersion int `json:"settings_version"`
 }
+
+const currentSettingsVersion = 2
 
 func NewDatabase(dbPath string) (*Database, error) {
 	// Create directory if not exists
@@ -54,8 +66,15 @@ func NewDatabase(dbPath string) (*Database, error) {
 	database := &Database{
 		dbPath:   dbPath,
 		Profiles: []RDPProfile{},
-		Settings: GlobalSettings{GlobalProxyMode: "disabled"},
-		History:  []HistoryEntry{},
+		Settings: GlobalSettings{
+			GlobalProxyMode:      "disabled",
+			DefaultResolution:    "1920x1080",
+			DefaultColorDepth:    "32",
+			DefaultClipboard:     true,
+			DefaultDisksRedirect: "all",
+			SettingsVersion:      currentSettingsVersion,
+		},
+		History: []HistoryEntry{},
 	}
 
 	// Load existing database if it exists
@@ -177,16 +196,38 @@ func (d *Database) GetGlobalSettings() (*GlobalSettings, error) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 
-	if d.Settings.GlobalProxyMode == "" {
-		d.Settings.GlobalProxyMode = "disabled"
+	s := d.Settings
+	if s.GlobalProxyMode == "" {
+		s.GlobalProxyMode = "disabled"
 	}
-	return &d.Settings, nil
+
+	// A database saved before these fields existed will have them at their
+	// Go zero values (empty string / false) after loading, which would be
+	// misread as "disabled"/"none" rather than "never configured". Backfill
+	// sensible defaults on every read until the user actually opens Settings
+	// and saves - at which point SaveGlobalSettings stamps the current
+	// version and their explicit choices (including any false/none) stick.
+	if s.SettingsVersion < currentSettingsVersion {
+		if s.DefaultResolution == "" {
+			s.DefaultResolution = "1920x1080"
+		}
+		if s.DefaultColorDepth == "" {
+			s.DefaultColorDepth = "32"
+		}
+		if s.DefaultDisksRedirect == "" {
+			s.DefaultDisksRedirect = "all"
+		}
+		s.DefaultClipboard = true
+	}
+
+	return &s, nil
 }
 
 func (d *Database) SaveGlobalSettings(settings *GlobalSettings) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
+	settings.SettingsVersion = currentSettingsVersion
 	d.Settings = *settings
 	return d.saveLocked()
 }

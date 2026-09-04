@@ -15,6 +15,7 @@ import (
 var (
 	kernel32 = syscall.NewLazyDLL("kernel32.dll")
 	user32   = syscall.NewLazyDLL("user32.dll")
+	gdi32    = syscall.NewLazyDLL("gdi32.dll")
 
 	procGetModuleHandleW    = kernel32.NewProc("GetModuleHandleW")
 	procRegisterClassExW    = user32.NewProc("RegisterClassExW")
@@ -29,6 +30,7 @@ var (
 	procDestroyWindow       = user32.NewProc("DestroyWindow")
 	procLoadCursorW         = user32.NewProc("LoadCursorW")
 	procSendDlgItemMessageW = user32.NewProc("SendDlgItemMessageW")
+	procSendMessageW        = user32.NewProc("SendMessageW")
 	procGetDlgItemTextW     = user32.NewProc("GetDlgItemTextW")
 	procSetDlgItemTextW     = user32.NewProc("SetDlgItemTextW")
 	procCheckDlgButton      = user32.NewProc("CheckDlgButton")
@@ -38,7 +40,30 @@ var (
 	procMessageBoxW         = user32.NewProc("MessageBoxW")
 	procPostMessageW        = user32.NewProc("PostMessageW")
 	procLoadIconW           = user32.NewProc("LoadIconW")
+	procGetStockObject      = gdi32.NewProc("GetStockObject")
+
+	// appFont is set once at startup (see CreateMainWindow) and applied to
+	// every control we create. Without this, controls default to the
+	// legacy "System" bitmap font (GDI stock SYSTEM_FONT), which does NOT
+	// contain Cyrillic (or most non-Latin) glyphs - text in those scripts
+	// silently fails to render even though the underlying UTF-16 string is
+	// correct. DEFAULT_GUI_FONT is the actual OS-configured UI font (the
+	// same one every native Windows dialog uses), which properly covers
+	// the user's configured language/locale.
+	appFont uintptr
 )
+
+const (
+	WM_SETFONT       = 0x0030
+	DEFAULT_GUI_FONT = 17
+)
+
+func applyFont(hwndControl uintptr) {
+	if hwndControl == 0 || appFont == 0 {
+		return
+	}
+	procSendMessageW.Call(hwndControl, WM_SETFONT, appFont, 1)
+}
 
 type WNDCLASSEXW struct {
 	cbSize        uint32
@@ -113,6 +138,7 @@ const (
 	// box). Using the wrong value here meant the host-selection handler
 	// was effectively never invoked when picking an item from the list.
 	CBN_SELCHANGE = 1
+	CBN_EDITCHANGE = 5 // sent while typing/pasting in an editable combo's text box
 	BN_CLICKED    = 0
 
 	MB_OK        = 0x00000000
@@ -132,30 +158,36 @@ const (
 	ID_DELETE     = 106
 	ID_SETTINGS   = 107
 	ID_HISTORY    = 109
+	ID_PWD_STATUS = 110
 )
 
 // Control IDs - Edit window
 const (
-	ID_E_HOST      = 201
-	ID_E_PORT      = 202
-	ID_E_USER      = 203
-	ID_E_PASS      = 204
-	ID_E_RES       = 205
-	ID_E_CLIPBOARD = 206
-	ID_E_DISKS     = 207
-	ID_E_PROXYMODE = 208
-	ID_E_PROXYADDR = 209
-	ID_E_SAVE      = 210
-	ID_E_CANCEL    = 211
-	ID_E_DELETE    = 212
+	ID_E_HOST       = 201
+	ID_E_PORT       = 202
+	ID_E_USER       = 203
+	ID_E_PASS       = 204
+	ID_E_RES        = 205
+	ID_E_CLIPBOARD  = 206
+	ID_E_DISKS      = 207 // now a 4-choice dropdownlist, not a checkbox
+	ID_E_PROXYMODE  = 208
+	ID_E_PROXYADDR  = 209
+	ID_E_SAVE       = 210
+	ID_E_CANCEL     = 211
+	ID_E_DELETE     = 212
+	ID_E_COLORDEPTH = 213
 )
 
 // Control IDs - Settings window
 const (
-	ID_S_PROXYMODE = 301
-	ID_S_PROXYADDR = 302
-	ID_S_SAVE      = 303
-	ID_S_CANCEL    = 304
+	ID_S_PROXYMODE  = 301
+	ID_S_PROXYADDR  = 302
+	ID_S_SAVE       = 303
+	ID_S_CANCEL     = 304
+	ID_S_RES        = 305
+	ID_S_COLORDEPTH = 306
+	ID_S_CLIPBOARD  = 307
+	ID_S_DISKS      = 308
 )
 
 // Control IDs - History window
@@ -243,7 +275,7 @@ func isChecked(hwndParent uintptr, id int) bool {
 }
 
 func createLabel(parent uintptr, text string, x, y, w, h int32) {
-	procCreateWindowExW.Call(
+	ret, _, _ := procCreateWindowExW.Call(
 		0,
 		uintptr(unsafe.Pointer(utf16ptr("STATIC"))),
 		uintptr(unsafe.Pointer(utf16ptr(text))),
@@ -251,6 +283,21 @@ func createLabel(parent uintptr, text string, x, y, w, h int32) {
 		uintptr(x), uintptr(y), uintptr(w), uintptr(h),
 		parent, 0, hInstance, 0,
 	)
+	applyFont(ret)
+}
+
+// createLabelID is like createLabel but with a control ID, for labels whose
+// text needs to be updated later via setDlgText (e.g. status indicators).
+func createLabelID(parent uintptr, id int, text string, x, y, w, h int32) {
+	ret, _, _ := procCreateWindowExW.Call(
+		0,
+		uintptr(unsafe.Pointer(utf16ptr("STATIC"))),
+		uintptr(unsafe.Pointer(utf16ptr(text))),
+		uintptr(WS_CHILD|WS_VISIBLE),
+		uintptr(x), uintptr(y), uintptr(w), uintptr(h),
+		parent, uintptr(id), hInstance, 0,
+	)
+	applyFont(ret)
 }
 
 func createEdit(parent uintptr, id int, text string, x, y, w, h int32, password bool) {
@@ -258,7 +305,7 @@ func createEdit(parent uintptr, id int, text string, x, y, w, h int32, password 
 	if password {
 		style |= ES_PASSWORD
 	}
-	procCreateWindowExW.Call(
+	ret, _, _ := procCreateWindowExW.Call(
 		0,
 		uintptr(unsafe.Pointer(utf16ptr("EDIT"))),
 		uintptr(unsafe.Pointer(utf16ptr(text))),
@@ -266,10 +313,11 @@ func createEdit(parent uintptr, id int, text string, x, y, w, h int32, password 
 		uintptr(x), uintptr(y), uintptr(w), uintptr(h),
 		parent, uintptr(id), hInstance, 0,
 	)
+	applyFont(ret)
 }
 
 func createCombo(parent uintptr, id int, x, y, w, h int32) {
-	procCreateWindowExW.Call(
+	ret, _, _ := procCreateWindowExW.Call(
 		0,
 		uintptr(unsafe.Pointer(utf16ptr("COMBOBOX"))),
 		0,
@@ -277,6 +325,7 @@ func createCombo(parent uintptr, id int, x, y, w, h int32) {
 		uintptr(x), uintptr(y), uintptr(w), uintptr(h),
 		parent, uintptr(id), hInstance, 0,
 	)
+	applyFont(ret)
 }
 
 // createComboEditable creates a combo box that both offers a dropdown list
@@ -284,7 +333,7 @@ func createCombo(parent uintptr, id int, x, y, w, h int32) {
 // of CBS_DROPDOWNLIST). Used for Host/Username fields so a host:port or an
 // arbitrary username can be typed directly, not just picked from a list.
 func createComboEditable(parent uintptr, id int, x, y, w, h int32) {
-	procCreateWindowExW.Call(
+	ret, _, _ := procCreateWindowExW.Call(
 		0,
 		uintptr(unsafe.Pointer(utf16ptr("COMBOBOX"))),
 		0,
@@ -292,10 +341,11 @@ func createComboEditable(parent uintptr, id int, x, y, w, h int32) {
 		uintptr(x), uintptr(y), uintptr(w), uintptr(h),
 		parent, uintptr(id), hInstance, 0,
 	)
+	applyFont(ret)
 }
 
 func createButton(parent uintptr, id int, text string, x, y, w, h int32) {
-	procCreateWindowExW.Call(
+	ret, _, _ := procCreateWindowExW.Call(
 		0,
 		uintptr(unsafe.Pointer(utf16ptr("BUTTON"))),
 		uintptr(unsafe.Pointer(utf16ptr(text))),
@@ -303,10 +353,11 @@ func createButton(parent uintptr, id int, text string, x, y, w, h int32) {
 		uintptr(x), uintptr(y), uintptr(w), uintptr(h),
 		parent, uintptr(id), hInstance, 0,
 	)
+	applyFont(ret)
 }
 
 func createCheckbox(parent uintptr, id int, text string, x, y, w, h int32) {
-	procCreateWindowExW.Call(
+	ret, _, _ := procCreateWindowExW.Call(
 		0,
 		uintptr(unsafe.Pointer(utf16ptr("BUTTON"))),
 		uintptr(unsafe.Pointer(utf16ptr(text))),
@@ -314,10 +365,11 @@ func createCheckbox(parent uintptr, id int, text string, x, y, w, h int32) {
 		uintptr(x), uintptr(y), uintptr(w), uintptr(h),
 		parent, uintptr(id), hInstance, 0,
 	)
+	applyFont(ret)
 }
 
 func createListBox(parent uintptr, id int, x, y, w, h int32) {
-	procCreateWindowExW.Call(
+	ret, _, _ := procCreateWindowExW.Call(
 		0,
 		uintptr(unsafe.Pointer(utf16ptr("LISTBOX"))),
 		0,
@@ -325,6 +377,7 @@ func createListBox(parent uintptr, id int, x, y, w, h int32) {
 		uintptr(x), uintptr(y), uintptr(w), uintptr(h),
 		parent, uintptr(id), hInstance, 0,
 	)
+	applyFont(ret)
 }
 
 func listReset(hwndParent uintptr, id int) {
@@ -358,6 +411,8 @@ func CreateMainWindow(database *Database, executor *RDPExecutor) error {
 
 	hMod, _, _ := procGetModuleHandleW.Call(0)
 	hInstance = hMod
+
+	appFont, _, _ = procGetStockObject.Call(DEFAULT_GUI_FONT)
 
 	mainProc := syscall.NewCallback(mainWndProc)
 	editProc := syscall.NewCallback(editWndProc)
@@ -460,7 +515,8 @@ func mainWndProc(hwnd uintptr, msg uint32, wparam, lparam uintptr) uintptr {
 		createButton(hwnd, ID_SETTINGS, "Global Settings", 15, 135, 165, 30)
 		createButton(hwnd, ID_HISTORY, "Connection History", 190, 135, 165, 30)
 
-		createLabel(hwnd, "Tip: you can type a host (optionally host:port) directly, or pick one from the list.", 15, 180, 440, 40)
+		createLabelID(hwnd, ID_PWD_STATUS, "", 15, 172, 440, 20)
+		createLabel(hwnd, "Tip: you can type a host (optionally host:port) directly, or pick one from the list.", 15, 195, 440, 40)
 
 		refreshHostCombo(hwnd)
 		if len(hostList) > 0 {
@@ -473,8 +529,10 @@ func mainWndProc(hwnd uintptr, msg uint32, wparam, lparam uintptr) uintptr {
 		id := int(loword(wparam))
 		code := int(hiword(wparam))
 
-		if id == ID_HOST_COMBO && code == CBN_SELCHANGE {
+		if id == ID_HOST_COMBO && (code == CBN_SELCHANGE || code == CBN_EDITCHANGE) {
 			onHostChanged(hwnd)
+		} else if id == ID_USER_COMBO && (code == CBN_SELCHANGE || code == CBN_EDITCHANGE) {
+			updatePasswordStatus(hwnd)
 		} else if code == BN_CLICKED {
 			switch id {
 			case ID_CONNECT:
@@ -540,6 +598,7 @@ func onHostChanged(hwnd uintptr) {
 
 	if len(profiles) > 0 {
 		comboSetSel(hwnd, ID_USER_COMBO, 0)
+		updatePasswordStatus(hwnd)
 		return
 	}
 
@@ -548,6 +607,30 @@ func onHostChanged(hwnd uintptr) {
 	if hint := getCachedUsernameHint(host); hint != "" {
 		setDlgText(hwnd, ID_USER_COMBO, hint)
 	}
+	updatePasswordStatus(hwnd)
+}
+
+// updatePasswordStatus shows whether the currently typed/selected
+// host+username has a saved password on file - mirroring how the system
+// RDP client indicates a stored credential without ever revealing it.
+func updatePasswordStatus(hwnd uintptr) {
+	username := strings.TrimSpace(getDlgText(hwnd, ID_USER_COMBO))
+	status := ""
+
+	if username != "" {
+		for _, p := range currentProfiles {
+			if p.Username == username {
+				if p.Password != "" {
+					status = "🔒 Saved password on file for this account"
+				} else {
+					status = "No saved password - you will be prompted"
+				}
+				break
+			}
+		}
+	}
+
+	setDlgText(hwnd, ID_PWD_STATUS, status)
 }
 
 // parseHostPort splits "host" or "host:port" into its parts. hasPort is
@@ -597,15 +680,13 @@ func buildConnectionProfile(hwnd uintptr) (*RDPProfile, error) {
 	}
 
 	profile := &RDPProfile{
-		Host:             host,
-		Port:             3389,
-		Username:         username,
-		Resolution:       "1920x1080",
-		ClipboardEnabled: true,
-		DisksEnabled:     true,
-		DisksRedirect:    "all",
-		DisksDynamic:     true,
-		ProxyMode:        "direct",
+		Host:      host,
+		Port:      3389,
+		Username:  username,
+		ProxyMode: "direct",
+		// Resolution/ColorDepth/ClipboardMode/DisksRedirect left empty:
+		// a quick-connect (unsaved) profile just inherits whatever is
+		// configured in Global Settings.
 	}
 	if hasPort {
 		profile.Port = port
@@ -626,15 +707,67 @@ func onConnectClicked(hwnd uintptr) {
 	}
 }
 
+// ==================== Tri-state setting label mapping ====================
+//
+// ClipboardMode/DisksRedirect are stored as plain machine-readable strings
+// ("on"/"off", "none"/"all"/"dynamic"), but the dropdowns show human labels.
+// "" (empty) always means "inherit the global default" and only appears as
+// a choice in per-profile dropdowns, not in Global Settings itself.
+
+const inheritLabel = "Inherit (global default)"
+
+func clipboardModeToLabel(mode string) string {
+	switch mode {
+	case "on":
+		return "Enabled"
+	case "off":
+		return "Disabled"
+	default:
+		return inheritLabel
+	}
+}
+
+func labelToClipboardMode(label string) string {
+	switch label {
+	case "Enabled":
+		return "on"
+	case "Disabled":
+		return "off"
+	default:
+		return ""
+	}
+}
+
+func disksRedirectToLabel(v string) string {
+	switch v {
+	case "none":
+		return "None"
+	case "all":
+		return "All drives"
+	case "dynamic":
+		return "Dynamic (added later) only"
+	default:
+		return inheritLabel
+	}
+}
+
+func labelToDisksRedirect(label string) string {
+	switch label {
+	case "None":
+		return "none"
+	case "All drives":
+		return "all"
+	case "Dynamic (added later) only":
+		return "dynamic"
+	default:
+		return ""
+	}
+}
+
 func onNewClicked(hwnd uintptr) {
 	prefill := &RDPProfile{
-		Port:             3389,
-		Resolution:       "1920x1080",
-		ClipboardEnabled: true,
-		DisksEnabled:     true,
-		DisksRedirect:    "all",
-		DisksDynamic:     true,
-		ProxyMode:        "direct",
+		Port:      3389,
+		ProxyMode: "direct",
 	}
 
 	rawHost := strings.TrimSpace(getDlgText(hwnd, ID_HOST_COMBO))
@@ -661,15 +794,10 @@ func onEditClicked(hwnd uintptr) {
 	username := strings.TrimSpace(getDlgText(hwnd, ID_USER_COMBO))
 
 	prefill := &RDPProfile{
-		Host:             host,
-		Port:             3389,
-		Username:         username,
-		Resolution:       "1920x1080",
-		ClipboardEnabled: true,
-		DisksEnabled:     true,
-		DisksRedirect:    "all",
-		DisksDynamic:     true,
-		ProxyMode:        "direct",
+		Host:      host,
+		Port:      3389,
+		Username:  username,
+		ProxyMode: "direct",
 	}
 	if hasPort {
 		prefill.Port = port
@@ -708,13 +836,8 @@ func onDeleteClicked(hwnd uintptr) {
 func openEditWindow(owner uintptr, prefill *RDPProfile) {
 	if prefill == nil {
 		prefill = &RDPProfile{
-			Port:             3389,
-			Resolution:       "1920x1080",
-			ClipboardEnabled: true,
-			DisksEnabled:     true,
-			DisksRedirect:    "all",
-			DisksDynamic:     true,
-			ProxyMode:        "direct",
+			Port:      3389,
+			ProxyMode: "direct",
 		}
 	}
 
@@ -747,7 +870,7 @@ func openEditWindow(owner uintptr, prefill *RDPProfile) {
 		uintptr(unsafe.Pointer(utf16ptr("RDPEditWindowClass"))),
 		uintptr(unsafe.Pointer(utf16ptr(title))),
 		style,
-		250, 150, 420, 500,
+		250, 150, 420, 540,
 		owner, 0, hInstance, 0,
 	)
 
@@ -776,15 +899,37 @@ func editWndProc(hwnd uintptr, msg uint32, wparam, lparam uintptr) uintptr {
 		y += 40
 
 		createLabel(hwnd, "Resolution:", 15, y, 100, 20)
-		createCombo(hwnd, ID_E_RES, 130, y-2, 250, 200)
+		createComboEditable(hwnd, ID_E_RES, 130, y-2, 250, 200)
+		comboAddString(hwnd, ID_E_RES, "") // inherit = blank
 		for _, r := range GetResolutionOptions() {
 			comboAddString(hwnd, ID_E_RES, r)
 		}
+		setDlgText(hwnd, ID_E_RES, editingProfile.Resolution)
 		y += 32
 
-		createCheckbox(hwnd, ID_E_CLIPBOARD, "Enable clipboard redirection", 15, y, 300, 22)
-		y += 28
-		createCheckbox(hwnd, ID_E_DISKS, "Enable disk redirection (drives)", 15, y, 300, 22)
+		createLabel(hwnd, "Color depth:", 15, y, 100, 20)
+		createComboEditable(hwnd, ID_E_COLORDEPTH, 130, y-2, 150, 200)
+		comboAddString(hwnd, ID_E_COLORDEPTH, "") // inherit = blank
+		for _, c := range GetColorDepthOptions() {
+			comboAddString(hwnd, ID_E_COLORDEPTH, c)
+		}
+		setDlgText(hwnd, ID_E_COLORDEPTH, editingProfile.ColorDepth)
+		y += 32
+
+		createLabel(hwnd, "Clipboard:", 15, y, 100, 20)
+		createCombo(hwnd, ID_E_CLIPBOARD, 130, y-2, 200, 200)
+		for _, label := range []string{inheritLabel, "Enabled", "Disabled"} {
+			comboAddString(hwnd, ID_E_CLIPBOARD, label)
+		}
+		selectComboByText(hwnd, ID_E_CLIPBOARD, clipboardModeToLabel(editingProfile.ClipboardMode))
+		y += 32
+
+		createLabel(hwnd, "Disk redirect:", 15, y, 100, 20)
+		createCombo(hwnd, ID_E_DISKS, 130, y-2, 250, 200)
+		for _, label := range []string{inheritLabel, "None", "All drives", "Dynamic (added later) only"} {
+			comboAddString(hwnd, ID_E_DISKS, label)
+		}
+		selectComboByText(hwnd, ID_E_DISKS, disksRedirectToLabel(editingProfile.DisksRedirect))
 		y += 40
 
 		createLabel(hwnd, "Proxy mode:", 15, y, 100, 20)
@@ -802,11 +947,7 @@ func editWndProc(hwnd uintptr, msg uint32, wparam, lparam uintptr) uintptr {
 		createButton(hwnd, ID_E_DELETE, "Delete", 150, y, 100, 32)
 		createButton(hwnd, ID_E_CANCEL, "Cancel", 260, y, 100, 32)
 
-		// Populate values
-		selectComboByText(hwnd, ID_E_RES, editingProfile.Resolution)
 		selectComboByText(hwnd, ID_E_PROXYMODE, editingProfile.ProxyMode)
-		setChecked(hwnd, ID_E_CLIPBOARD, editingProfile.ClipboardEnabled)
-		setChecked(hwnd, ID_E_DISKS, editingProfile.DisksEnabled)
 
 		return 0
 
@@ -844,16 +985,12 @@ func saveEditWindow(hwnd uintptr) {
 	editingProfile.Host = getDlgText(hwnd, ID_E_HOST)
 	editingProfile.Username = getDlgText(hwnd, ID_E_USER)
 	editingProfile.Password = getDlgText(hwnd, ID_E_PASS)
-	editingProfile.Resolution = getDlgText(hwnd, ID_E_RES)
+	editingProfile.Resolution = strings.TrimSpace(getDlgText(hwnd, ID_E_RES))
+	editingProfile.ColorDepth = strings.TrimSpace(getDlgText(hwnd, ID_E_COLORDEPTH))
+	editingProfile.ClipboardMode = labelToClipboardMode(getDlgText(hwnd, ID_E_CLIPBOARD))
+	editingProfile.DisksRedirect = labelToDisksRedirect(getDlgText(hwnd, ID_E_DISKS))
 	editingProfile.ProxyMode = getDlgText(hwnd, ID_E_PROXYMODE)
 	editingProfile.ProxyAddress = getDlgText(hwnd, ID_E_PROXYADDR)
-	editingProfile.ClipboardEnabled = isChecked(hwnd, ID_E_CLIPBOARD)
-	editingProfile.DisksEnabled = isChecked(hwnd, ID_E_DISKS)
-	if editingProfile.DisksEnabled {
-		editingProfile.DisksRedirect = "all"
-	} else {
-		editingProfile.DisksRedirect = "none"
-	}
 
 	portStr := getDlgText(hwnd, ID_E_PORT)
 	if p, ok := atoi(portStr); ok && p > 0 {
@@ -907,7 +1044,7 @@ func openSettingsWindow(owner uintptr) {
 		uintptr(unsafe.Pointer(utf16ptr("RDPSettingsWindowClass"))),
 		uintptr(unsafe.Pointer(utf16ptr("Global Settings"))),
 		style,
-		300, 250, 380, 240,
+		300, 250, 400, 400,
 		owner, 0, hInstance, 0,
 	)
 
@@ -919,18 +1056,57 @@ func settingsWndProc(hwnd uintptr, msg uint32, wparam, lparam uintptr) uintptr {
 	switch msg {
 	case WM_CREATE:
 		settings, _ := db.GetGlobalSettings()
+		y := int32(15)
 
-		createLabel(hwnd, "SOCKS5 proxy:", 15, 20, 120, 20)
-		createCombo(hwnd, ID_S_PROXYMODE, 140, 18, 150, 200)
+		createLabel(hwnd, "SOCKS5 proxy:", 15, y, 150, 20)
+		createCombo(hwnd, ID_S_PROXYMODE, 170, y-2, 150, 200)
 		comboAddString(hwnd, ID_S_PROXYMODE, "disabled")
 		comboAddString(hwnd, ID_S_PROXYMODE, "enabled")
 		selectComboByText(hwnd, ID_S_PROXYMODE, settings.GlobalProxyMode)
+		y += 30
 
-		createLabel(hwnd, "Address (host:port):", 15, 60, 200, 20)
-		createEdit(hwnd, ID_S_PROXYADDR, settings.GlobalProxyAddress, 15, 85, 275, 22, false)
+		createLabel(hwnd, "Proxy address (host:port):", 15, y, 200, 20)
+		y += 24
+		createEdit(hwnd, ID_S_PROXYADDR, settings.GlobalProxyAddress, 15, y, 320, 22, false)
+		y += 40
 
-		createButton(hwnd, ID_S_SAVE, "Save", 40, 140, 100, 32)
-		createButton(hwnd, ID_S_CANCEL, "Cancel", 160, 140, 100, 32)
+		createLabel(hwnd, "Default resolution:", 15, y, 150, 20)
+		createComboEditable(hwnd, ID_S_RES, 170, y-2, 150, 200)
+		for _, r := range GetResolutionOptions() {
+			comboAddString(hwnd, ID_S_RES, r)
+		}
+		setDlgText(hwnd, ID_S_RES, settings.DefaultResolution)
+		y += 32
+
+		createLabel(hwnd, "Default color depth:", 15, y, 150, 20)
+		createComboEditable(hwnd, ID_S_COLORDEPTH, 170, y-2, 150, 200)
+		for _, c := range GetColorDepthOptions() {
+			comboAddString(hwnd, ID_S_COLORDEPTH, c)
+		}
+		setDlgText(hwnd, ID_S_COLORDEPTH, settings.DefaultColorDepth)
+		y += 32
+
+		createLabel(hwnd, "Default clipboard:", 15, y, 150, 20)
+		createCombo(hwnd, ID_S_CLIPBOARD, 170, y-2, 150, 200)
+		comboAddString(hwnd, ID_S_CLIPBOARD, "Enabled")
+		comboAddString(hwnd, ID_S_CLIPBOARD, "Disabled")
+		if settings.DefaultClipboard {
+			selectComboByText(hwnd, ID_S_CLIPBOARD, "Enabled")
+		} else {
+			selectComboByText(hwnd, ID_S_CLIPBOARD, "Disabled")
+		}
+		y += 32
+
+		createLabel(hwnd, "Default disk redirect:", 15, y, 150, 20)
+		createCombo(hwnd, ID_S_DISKS, 170, y-2, 200, 200)
+		for _, label := range []string{"None", "All drives", "Dynamic (added later) only"} {
+			comboAddString(hwnd, ID_S_DISKS, label)
+		}
+		selectComboByText(hwnd, ID_S_DISKS, disksRedirectToLabel(settings.DefaultDisksRedirect))
+		y += 45
+
+		createButton(hwnd, ID_S_SAVE, "Save", 60, y, 120, 32)
+		createButton(hwnd, ID_S_CANCEL, "Cancel", 200, y, 120, 32)
 		return 0
 
 	case WM_COMMAND:
@@ -940,12 +1116,24 @@ func settingsWndProc(hwnd uintptr, msg uint32, wparam, lparam uintptr) uintptr {
 		if code == BN_CLICKED {
 			switch id {
 			case ID_S_SAVE:
-				mode := getDlgText(hwnd, ID_S_PROXYMODE)
-				addr := getDlgText(hwnd, ID_S_PROXYADDR)
-				db.SaveGlobalSettings(&GlobalSettings{
-					GlobalProxyMode:    mode,
-					GlobalProxyAddress: addr,
-				})
+				newSettings := &GlobalSettings{
+					GlobalProxyMode:      getDlgText(hwnd, ID_S_PROXYMODE),
+					GlobalProxyAddress:   getDlgText(hwnd, ID_S_PROXYADDR),
+					DefaultResolution:    strings.TrimSpace(getDlgText(hwnd, ID_S_RES)),
+					DefaultColorDepth:    strings.TrimSpace(getDlgText(hwnd, ID_S_COLORDEPTH)),
+					DefaultClipboard:     getDlgText(hwnd, ID_S_CLIPBOARD) == "Enabled",
+					DefaultDisksRedirect: labelToDisksRedirect(getDlgText(hwnd, ID_S_DISKS)),
+				}
+				if newSettings.DefaultResolution == "" {
+					newSettings.DefaultResolution = "1920x1080"
+				}
+				if newSettings.DefaultColorDepth == "" {
+					newSettings.DefaultColorDepth = "32"
+				}
+				if newSettings.DefaultDisksRedirect == "" {
+					newSettings.DefaultDisksRedirect = "all"
+				}
+				db.SaveGlobalSettings(newSettings)
 				procDestroyWindow.Call(hwnd)
 			case ID_S_CANCEL:
 				procDestroyWindow.Call(hwnd)
@@ -1172,6 +1360,7 @@ func jumpToHostInMainWindow(host, username string) {
 
 	if username != "" {
 		setDlgText(mainHwnd, ID_USER_COMBO, username)
+		updatePasswordStatus(mainHwnd)
 	}
 }
 

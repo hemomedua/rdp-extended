@@ -134,16 +134,13 @@ func cmdAdd(args []string, db *Database) {
 	}
 
 	profile := &RDPProfile{
-		Host:              args[0],
-		Username:          args[1],
-		Password:          args[2],
-		Port:              3389,
-		Resolution:        "1920x1080",
-		ClipboardEnabled:  true,
-		DisksEnabled:      true,
-		DisksRedirect:     "all",
-		DisksDynamic:      true,
-		ProxyMode:         "direct",
+		Host:      args[0],
+		Username:  args[1],
+		Password:  args[2],
+		Port:      3389,
+		ProxyMode: "direct",
+		// Resolution/ColorDepth/ClipboardMode/DisksRedirect left empty =
+		// inherit the global defaults configured in Settings.
 	}
 
 	if err := db.AddProfile(profile); err != nil {
